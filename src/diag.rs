@@ -166,6 +166,69 @@ pub fn before(data: &Path, start: Instant) -> Before {
     }
 }
 
+/// Reruns this binary as a child with each setting below (second of two
+/// runs, so warm), and reports its phase times, wall time and CPU time.
+fn scaling(data: &Path) -> String {
+    let scratch = std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/tmp".into());
+    let configs: [(&str, &[(&str, &str)]); 7] = [
+        ("t8", &[("SESSIONS_THREADS", "8")]),
+        ("t4", &[("SESSIONS_THREADS", "4")]),
+        ("t2", &[("SESSIONS_THREADS", "2")]),
+        ("t1", &[("SESSIONS_THREADS", "1")]),
+        ("t16", &[("SESSIONS_THREADS", "16")]),
+        ("t8-mi-keep-large", &[("SESSIONS_THREADS", "8"), ("SESSIONS_MI", "keep-large")]),
+        ("t8-read-both", &[("SESSIONS_THREADS", "8"), ("SESSIONS_READ", "both")]),
+    ];
+    let mut lines = Vec::new();
+    for (name, settings) in configs {
+        let mut result = String::new();
+        for _ in 0..2 {
+            let out = Path::new(&scratch).join(format!("diag-{name}"));
+            let _ = fs::remove_dir_all(&out);
+            let mut command = std::process::Command::new("/proc/self/exe");
+            command
+                .env("SESSIONS_DIAG", "0")
+                .env("DATA_DIR", data)
+                .env("OUTPUT_DIR", &out);
+            for (key, value) in settings {
+                command.env(key, value);
+            }
+            let usage = |who| unsafe {
+                let mut u: libc::rusage = std::mem::zeroed();
+                libc::getrusage(who, &mut u);
+                (u.ru_utime.tv_sec as f64 + u.ru_utime.tv_usec as f64 / 1e6,
+                 u.ru_stime.tv_sec as f64 + u.ru_stime.tv_usec as f64 / 1e6)
+            };
+            let before = usage(libc::RUSAGE_CHILDREN);
+            let started = Instant::now();
+            let Ok(child) = command.output() else {
+                result = "failed to start".into();
+                break;
+            };
+            let wall = started.elapsed().as_secs_f64();
+            let after = usage(libc::RUSAGE_CHILDREN);
+            let phases = String::from_utf8_lossy(&child.stderr)
+                .lines()
+                .filter_map(|line| {
+                    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+                    let mut parts = inner.splitn(3, ' ');
+                    let time = parts.next()?;
+                    let word = parts.next()?;
+                    Some(format!("{}={time}", &word[..word.len().min(5)]))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            result = format!(
+                "wall {wall:.3} user {:.2} sys {:.2} | {phases}",
+                after.0 - before.0,
+                after.1 - before.1
+            );
+        }
+        lines.push(format!("{name}: {result}"));
+    }
+    lines.join("\n[diag] ")
+}
+
 /// After the pipeline: a warm rerun, read speeds, the machine, then the
 /// summary as the last lines. Exits 1.
 pub fn after(
@@ -184,7 +247,7 @@ pub fn after(
     let warm_log = take_log();
     let warm_read = read_all(data);
     let direct_read = read_direct(data);
-
+    let scaling = scaling(data);
     let cpus = std::thread::available_parallelism().map_or(0, usize::from);
     let summary = [
         format!(
@@ -194,6 +257,7 @@ pub fn after(
         format!("diag setup took {:.3}s", first.startup),
         format!("FIRST RUN: {cold_log}"),
         format!("WARM RUN: {warm_log}"),
+        scaling,
         format!("read speed: warm {warm_read:.2} GB/s, O_DIRECT disk {direct_read:.2} GB/s"),
         format!(
             "cpus available {cpus}; {}; {}",
