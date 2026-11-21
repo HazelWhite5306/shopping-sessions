@@ -9,6 +9,7 @@
 //! files, and shards are read in place, so memory stays small.
 
 mod csv;
+mod key;
 mod out;
 mod ts;
 
@@ -23,6 +24,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+use key::Key;
 use out::{CampaignRow, UserRow};
 use ts::DAY;
 
@@ -119,7 +121,7 @@ fn hash_bytes(s: &[u8]) -> u64 {
     const K2: u64 = 0x8ebc_6af0_9c88_c6e3;
     let n = s.len();
     let mut seed = K0 ^ (n as u64).wrapping_mul(K2);
-    let (a, b) = if n >= 8 {
+    let (a, b) = if n > 16 {
         let mut at = 0;
         while n - at > 16 {
             let x = u64::from_le_bytes(s[at..at + 8].try_into().unwrap());
@@ -127,8 +129,14 @@ fn hash_bytes(s: &[u8]) -> u64 {
             seed = fold(x ^ K1, y ^ seed);
             at += 16;
         }
+        // The last 16 bytes, overlapping what the loop already mixed.
         (
-            u64::from_le_bytes(s[at..at + 8].try_into().unwrap()),
+            u64::from_le_bytes(s[n - 16..n - 8].try_into().unwrap()),
+            u64::from_le_bytes(s[n - 8..].try_into().unwrap()),
+        )
+    } else if n >= 8 {
+        (
+            u64::from_le_bytes(s[..8].try_into().unwrap()),
             u64::from_le_bytes(s[n - 8..].try_into().unwrap()),
         )
     } else if n >= 4 {
@@ -300,8 +308,8 @@ impl<'a> Lookup<'a> {
 /// One parsed copy of an event, before dedup (40 bytes).
 #[derive(Clone, Copy)]
 struct EventCopy {
-    event_id: Text,
-    user_id: Text,
+    event_id: Key,
+    user_id: Key,
     ts: i64,
     ingest: i64,
     /// Price for a valid purchase, 0 for view and cart.
@@ -313,7 +321,7 @@ struct EventCopy {
 /// A kept, valid event, before its user ID is interned.
 #[derive(Clone, Copy)]
 struct LiveEvent {
-    user_id: Text,
+    user_id: Key,
     user_hash: u64,
     ts: i64,
     price: u32,
@@ -322,9 +330,9 @@ struct LiveEvent {
 
 #[derive(Clone, Copy)]
 struct ValidClick {
-    user_id: Text,
+    user_id: Key,
     user_hash: u64,
-    click_id: Text,
+    click_id: Key,
     ts: i64,
     campaign: u16,
 }
@@ -343,7 +351,7 @@ struct PersonClick {
     person: u32,
     campaign: u16,
     ts: i64,
-    click_id: Text,
+    click_id: Key,
 }
 
 #[inline]
@@ -374,7 +382,7 @@ struct Context<'a> {
 
 /// Parses an event line; returns the copy and its event-ID hash.
 #[inline]
-fn parse_event(line: &[u8], context: &Context) -> Option<(EventCopy, u64)> {
+fn parse_event(line: &[u8], context: &Context) -> Option<EventCopy> {
     let [event_id, user_id, ts_field, ingest_field, kind, product, price] = csv::split::<7>(line)?;
     if event_id.is_empty() {
         return None;
@@ -409,18 +417,15 @@ fn parse_event(line: &[u8], context: &Context) -> Option<(EventCopy, u64)> {
     } else {
         0
     };
-    Some((
-        EventCopy {
-            event_id: Text::new(event_id),
-            user_id: Text::new(user_id),
-            ts,
-            ingest,
-            price: price_cents,
-            category,
-            valid,
-        },
-        hash_bytes(event_id),
-    ))
+    Some(EventCopy {
+        event_id: Key::new(event_id),
+        user_id: Key::new(user_id),
+        ts,
+        ingest,
+        price: price_cents,
+        category,
+        valid,
+    })
 }
 
 #[inline]
@@ -434,10 +439,11 @@ fn parse_click(line: &[u8], context: &Context) -> Option<ValidClick> {
     if ts < context.window_start - WEEK || ts >= context.window_end {
         return None;
     }
+    let user_id = Key::new(user_id);
     Some(ValidClick {
-        user_id: Text::new(user_id),
-        user_hash: hash_bytes(user_id),
-        click_id: Text::new(click_id),
+        user_id,
+        user_hash: user_id.hash(),
+        click_id: Key::new(click_id),
         ts,
         campaign,
     })
@@ -458,23 +464,22 @@ fn shard_vecs<T>(shards: usize, each: usize) -> Vec<Vec<T>> {
 }
 
 struct Interner {
-    names: Vec<Text>,
+    names: Vec<Key>,
     hashes: Vec<u64>,
     table: HashTable<u32>,
 }
 
 impl Interner {
     #[inline]
-    fn intern(&mut self, id: Text, hash: u64) -> u32 {
+    fn intern(&mut self, id: Key, hash: u64) -> u32 {
         let Self {
             names,
             hashes,
             table,
         } = self;
-        let bytes = id.get();
         match table.entry(
             hash,
-            |&at| names[at as usize].get() == bytes,
+            |&at| names[at as usize] == id,
             |&at| hashes[at as usize],
         ) {
             Entry::Occupied(entry) => *entry.get(),
@@ -491,7 +496,7 @@ impl Interner {
 
 /// One user shard's interned IDs and rows.
 struct UserShard {
-    names: Vec<Text>,
+    names: Vec<Key>,
     /// (link side as link * 2 + side, local ID)
     link_sides: Vec<(u32, u32)>,
     events: Vec<PersonEvent>,
@@ -571,8 +576,8 @@ fn run(data: &Path, output: &Path, start: Instant) {
                     let mut shards: Vec<Vec<EventCopy>> =
                         shard_vecs(SHARDS, chunk.len() / 70 / SHARDS + 16);
                     csv::for_lines(chunk, |line| {
-                        if let Some((event, hash)) = parse_event(line, &context) {
-                            shards[shard(hash)].push(event);
+                        if let Some(event) = parse_event(line, &context) {
+                            shards[shard(event.event_id.hash())].push(event);
                         }
                     });
                     shards
@@ -629,12 +634,10 @@ fn run(data: &Path, output: &Path, start: Instant) {
             let mut table: HashTable<&EventCopy> = HashTable::with_capacity(total);
             for chunk in &events {
                 for copy in &chunk[at] {
-                    let id = copy.event_id.get();
-                    let hash = hash_bytes(id);
                     match table.entry(
-                        hash,
-                        |kept| kept.event_id == copy.event_id || kept.event_id.get() == id,
-                        |kept| hash_bytes(kept.event_id.get()),
+                        copy.event_id.hash(),
+                        |kept| kept.event_id == copy.event_id,
+                        |kept| kept.event_id.hash(),
                     ) {
                         Entry::Occupied(mut entry) => {
                             let kept = entry.get_mut();
@@ -651,7 +654,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
             let mut out: Vec<Vec<LiveEvent>> = shard_vecs(SHARDS, total / SHARDS + 16);
             for kept in table.iter() {
                 if kept.valid {
-                    let user_hash = hash_bytes(kept.user_id.get());
+                    let user_hash = kept.user_id.hash();
                     out[shard(user_hash)].push(LiveEvent {
                         user_id: kept.user_id,
                         user_hash,
@@ -668,11 +671,12 @@ fn run(data: &Path, output: &Path, start: Instant) {
     log(start, "deduplicated");
 
     // 3. Intern user IDs per shard, reading every producer's part in place.
-    let mut link_sides: Vec<Vec<(u32, Text, u64)>> = (0..SHARDS).map(|_| Vec::new()).collect();
+    let mut link_sides: Vec<Vec<(u32, Key, u64)>> = (0..SHARDS).map(|_| Vec::new()).collect();
     for (at, [a, b]) in links.iter().enumerate() {
         for (side, id) in [a, b].into_iter().enumerate() {
-            let hash = hash_bytes(id);
-            link_sides[shard(hash)].push(((at * 2 + side) as u32, Text::new(id), hash));
+            let id = Key::new(id);
+            let hash = id.hash();
+            link_sides[shard(hash)].push(((at * 2 + side) as u32, id, hash));
         }
     }
     let mut users: Vec<UserShard> = link_sides
@@ -728,7 +732,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
         base.push(count as u32);
         count += user_shard.names.len();
     }
-    let names: Vec<Text> = users
+    let names: Vec<Key> = users
         .iter()
         .flat_map(|user_shard| user_shard.names.iter().copied())
         .collect();
@@ -748,7 +752,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
         if ra != rb {
             parent[rb as usize] = ra;
             let (sa, sb) = (smallest[ra as usize], smallest[rb as usize]);
-            if names[sb as usize].get() < names[sa as usize].get() {
+            if names[sb as usize] < names[sa as usize] {
                 smallest[ra as usize] = sb;
             }
         }
@@ -808,7 +812,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
             clicks.sort_unstable_by(|a, b| {
                 (a.person, a.ts)
                     .cmp(&(b.person, b.ts))
-                    .then_with(|| a.click_id.get().cmp(b.click_id.get()))
+                    .then_with(|| a.click_id.cmp(&b.click_id))
             });
             sessionize(
                 &events,
@@ -839,7 +843,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
         .users
         .par_iter()
         .map(|&(who, day, sessions, events, revenue, top)| UserRow {
-            user_id: names[who as usize].get().to_vec(),
+            user_id: names[who as usize].to_vec(),
             day,
             sessions: i64::from(sessions),
             events: i64::from(events),
