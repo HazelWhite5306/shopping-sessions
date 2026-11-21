@@ -767,30 +767,27 @@ fn run(data: &Path, output: &Path, start: Instant) {
             let part = |chunk: usize| unsafe { &mut (&mut *rows.0.add(chunk))[at] };
             let total: usize = (0..chunk_count).map(|chunk| part(chunk).len()).sum();
             // Sized up front, so the table never grows and never rehashes.
-            let mut table: HashTable<*mut EventCopy> = HashTable::with_capacity(total);
+            // Entries hold the key itself, so a probe never follows a pointer.
+            let mut table: HashTable<(Key, *mut EventCopy)> = HashTable::with_capacity(total);
             for chunk in 0..chunk_count {
                 let copies = part(chunk);
                 let base = copies.as_mut_ptr();
                 for index in 0..copies.len() {
                     let copy = unsafe { base.add(index) };
                     let id = unsafe { (*copy).event_id };
-                    match table.entry(
-                        id.hash(),
-                        |&kept| unsafe { (*kept).event_id } == id,
-                        |&kept| unsafe { (*kept).event_id.hash() },
-                    ) {
+                    match table.entry(id.hash(), |kept| kept.0 == id, |kept| kept.0.hash()) {
                         Entry::Occupied(mut entry) => unsafe {
-                            let kept = *entry.get();
+                            let kept = entry.get().1;
                             if (*copy).ingest < (*kept).ingest {
                                 (*kept).price_category = INVALID;
-                                *entry.get_mut() = copy;
+                                entry.get_mut().1 = copy;
                             } else {
                                 // Equal ingest_ts means identical copies.
                                 (*copy).price_category = INVALID;
                             }
                         },
                         Entry::Vacant(entry) => {
-                            entry.insert(copy);
+                            entry.insert((id, copy));
                         }
                     }
                 }
