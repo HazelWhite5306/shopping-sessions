@@ -8,5 +8,6 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/sessions /usr/local/bin/sessions
+ENV SESSIONS_THREADS=4
 USER 1000
 ENTRYPOINT ["/usr/local/bin/sessions"]
