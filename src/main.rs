@@ -80,9 +80,14 @@ fn main() {
     let start = Instant::now();
     // Never hand freed memory back to the OS mid-run: re-faulting it cost as
     // much kernel time as the pipeline's own work. Large pages cut the rest.
+    let allocator = std::env::var("SESSIONS_MI").unwrap_or_else(|_| "default".into());
     unsafe {
-        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, -1);
-        libmimalloc_sys::mi_option_set(MI_OPTION_ALLOW_LARGE_OS_PAGES, 1);
+        if allocator.contains("keep") {
+            libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, -1);
+        }
+        if allocator.contains("large") {
+            libmimalloc_sys::mi_option_set(MI_OPTION_ALLOW_LARGE_OS_PAGES, 1);
+        }
     }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
@@ -244,7 +249,7 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
 /// parsers, many reads in flight), "both", or "none".
 fn read_mode() -> &'static str {
     static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    MODE.get_or_init(|| std::env::var("SESSIONS_READ").unwrap_or_else(|_| "both".into()))
+    MODE.get_or_init(|| std::env::var("SESSIONS_READ").unwrap_or_else(|_| "willneed".into()))
 }
 
 fn map(path: &Path) -> Option<Mmap> {
