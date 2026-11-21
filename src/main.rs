@@ -195,13 +195,41 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// How input pages are brought in: "seq" (page faults with sequential
+/// read-ahead), "willneed" (ask the kernel to read every file at once), or
+/// "populate" (each parse thread reads its chunk fully before parsing it).
+fn read_mode() -> &'static str {
+    static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| std::env::var("SESSIONS_READ").unwrap_or_else(|_| "willneed".into()))
+}
+
+/// Reads a chunk's pages in with one blocking call, so many chunks load in
+/// parallel at a high disk queue depth.
+fn populate(chunk: &[u8]) {
+    if read_mode() != "populate" || chunk.is_empty() {
+        return;
+    }
+    let start = chunk.as_ptr() as usize & !4095;
+    let end = chunk.as_ptr() as usize + chunk.len();
+    unsafe {
+        libc::madvise(start as *mut libc::c_void, end - start, 22 /* MADV_POPULATE_READ */);
+    }
+}
+
 fn map(path: &Path) -> Option<Mmap> {
     let file = File::open(path).ok()?;
     if file.metadata().ok()?.len() == 0 {
         return None;
     }
     let map = unsafe { Mmap::map(&file) }.ok()?;
-    let _ = map.advise(memmap2::Advice::Sequential);
+    match read_mode() {
+        "willneed" => {
+            let _ = map.advise(memmap2::Advice::WillNeed);
+        }
+        _ => {
+            let _ = map.advise(memmap2::Advice::Sequential);
+        }
+    }
     Some(map)
 }
 
@@ -632,6 +660,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
                 .map(|chunk| {
                     let mut shards: Vec<Vec<EventCopy>> =
                         shard_vecs(SHARDS, chunk.len() / 70 / SHARDS + 16);
+                    populate(chunk);
                     let mut clock = ts::Parser::new();
                     csv::for_records::<7>(chunk, |fields| {
                         if let Some(event) = parse_event(fields, &context, &mut clock) {
@@ -650,6 +679,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
                         .map(|chunk| {
                             let mut shards: Vec<Vec<ValidClick>> =
                                 shard_vecs(SHARDS, chunk.len() / 45 / SHARDS + 16);
+                            populate(chunk);
                             let mut clock = ts::Parser::new();
                             csv::for_records::<4>(chunk, |fields| {
                                 if let Some(click) = parse_click(fields, &context, &mut clock) {

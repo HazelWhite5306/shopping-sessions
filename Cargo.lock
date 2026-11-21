@@ -452,6 +452,7 @@ name = "sessions"
 version = "0.1.0"
 dependencies = [
  "hashbrown 0.16.1",
+ "libc",
  "libmimalloc-sys",
  "memchr",
  "memmap2",
