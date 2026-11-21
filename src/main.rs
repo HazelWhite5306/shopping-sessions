@@ -11,7 +11,6 @@
 mod csv;
 mod key;
 mod out;
-mod sort;
 mod ts;
 
 use std::fs::{self, File};
@@ -517,6 +516,7 @@ struct UserShard {
 /// Per-thread results of the session pass.
 struct Tally {
     users: Vec<(u32, i32, u32, u32, u64, u16)>,
+    sums: Vec<(u16, u64)>,
     /// (sessions, purchasing, revenue, assisted) per campaign and day.
     campaigns: Vec<[i64; 4]>,
     stamp: Vec<u64>,
@@ -847,70 +847,104 @@ fn run(data: &Path, output: &Path, start: Instant) {
     let campaign_slots = organic + 1;
     let empty_tally = || Tally {
         users: Vec::new(),
+        sums: Vec::new(),
         campaigns: vec![[0i64; 4]; campaign_slots * days],
         stamp: vec![u64::MAX; campaign_slots],
         session: 0,
     };
-    let person_bits = sort::bits(count as u64);
-    let event_ts_bits = sort::bits((window_end - window_start).max(0) as u64);
-    let click_start = window_start - WEEK;
-    let click_ts_bits = sort::bits((window_end - click_start).max(0) as u64);
+    // Each person belongs to exactly one bucket, so a slot per person can be
+    // shared across threads without overlap: first an event count, then the
+    // person's index (plus one) in its bucket.
+    struct Slots(*mut u32);
+    unsafe impl Sync for Slots {}
+    unsafe impl Send for Slots {}
+    let mut slot_memory = vec![0u32; count];
+    let slots = Slots(slot_memory.as_mut_ptr());
+    let slots = &slots;
     let tally = (0..BUCKETS)
         .into_par_iter()
         .fold(empty_tally, |mut tally, at| {
-            let event_count = regrouped.iter().map(|(e, _)| e[at].len()).sum();
-            let mut events: Vec<PersonEvent> = Vec::with_capacity(event_count);
+            #[allow(clippy::mut_from_ref)]
+            let slot = |person: u32| unsafe { &mut *slots.0.add(person as usize) };
+            // Count each person's events and number the people.
+            let mut people: Vec<u32> = Vec::new();
             for (part, _) in &regrouped {
-                events.extend_from_slice(&part[at]);
-            }
-            let click_count = regrouped.iter().map(|(_, c)| c[at].len()).sum();
-            let mut clicks: Vec<PersonClick> = Vec::with_capacity(click_count);
-            for (_, part) in &regrouped {
-                clicks.extend_from_slice(&part[at]);
-            }
-            // Radix sort on (person, ts) packed into 64 bits when they fit.
-            if person_bits + event_ts_bits <= 64 {
-                sort::radix_sort(&mut events, person_bits + event_ts_bits, |e| {
-                    u64::from(e.person) << event_ts_bits | (e.ts - window_start) as u64
-                });
-            } else {
-                events.sort_unstable_by_key(|e| (e.person, e.ts));
-            }
-            if person_bits + click_ts_bits <= 64 {
-                sort::radix_sort(&mut clicks, person_bits + click_ts_bits, |c| {
-                    u64::from(c.person) << click_ts_bits | (c.ts - click_start) as u64
-                });
-                // Equal (person, ts) runs are rare; order them by click_id.
-                let mut at = 0;
-                while at < clicks.len() {
-                    let mut end = at + 1;
-                    while end < clicks.len()
-                        && clicks[end].person == clicks[at].person
-                        && clicks[end].ts == clicks[at].ts
-                    {
-                        end += 1;
+                for event in &part[at] {
+                    let count = slot(event.person);
+                    if *count == 0 {
+                        people.push(event.person);
                     }
-                    if end - at > 1 {
-                        clicks[at..end].sort_unstable_by(|a, b| a.click_id.cmp(&b.click_id));
-                    }
-                    at = end;
+                    *count += 1;
                 }
-            } else {
-                clicks.sort_unstable_by(|a, b| {
-                    (a.person, a.ts)
-                        .cmp(&(b.person, b.ts))
-                        .then_with(|| a.click_id.cmp(&b.click_id))
-                });
             }
-            sessionize(
-                &events,
-                &clicks,
-                &mut tally,
-                first_day,
-                days,
-                organic,
-                &category_rank,
-            );
+            let mut starts: Vec<usize> = Vec::with_capacity(people.len() + 1);
+            let mut total = 0usize;
+            for (index, &person) in people.iter().enumerate() {
+                let count = slot(person);
+                starts.push(total);
+                total += *count as usize;
+                *count = index as u32 + 1;
+            }
+            starts.push(total);
+            // Place every event in its person's range, once.
+            let mut events: Vec<PersonEvent> = Vec::with_capacity(total);
+            let mut cursor = starts.clone();
+            unsafe {
+                let target = events.as_mut_ptr();
+                for (part, _) in &regrouped {
+                    for event in &part[at] {
+                        let index = *slot(event.person) as usize - 1;
+                        target.add(cursor[index]).write(*event);
+                        cursor[index] += 1;
+                    }
+                }
+                events.set_len(total);
+            }
+            // The same for clicks of people with events; the rest never count.
+            let mut click_starts = vec![0usize; people.len() + 1];
+            for (_, part) in &regrouped {
+                for click in &part[at] {
+                    let index = *slot(click.person) as usize;
+                    if index != 0 {
+                        click_starts[index] += 1;
+                    }
+                }
+            }
+            for index in 0..people.len() {
+                click_starts[index + 1] += click_starts[index];
+            }
+            let click_total = click_starts[people.len()];
+            let mut clicks: Vec<PersonClick> = Vec::with_capacity(click_total);
+            let mut cursor = click_starts.clone();
+            unsafe {
+                let target = clicks.as_mut_ptr();
+                for (_, part) in &regrouped {
+                    for click in &part[at] {
+                        let index = *slot(click.person) as usize;
+                        if index != 0 {
+                            target.add(cursor[index - 1]).write(*click);
+                            cursor[index - 1] += 1;
+                        }
+                    }
+                }
+                clicks.set_len(click_total);
+            }
+            // Each person's few events by ts, and clicks by (ts, click_id).
+            for index in 0..people.len() {
+                let mine = &mut events[starts[index]..starts[index + 1]];
+                mine.sort_unstable_by_key(|e| e.ts);
+                let their_clicks = &mut clicks[click_starts[index]..click_starts[index + 1]];
+                their_clicks.sort_unstable_by(|a, b| (a.ts, a.click_id).cmp(&(b.ts, b.click_id)));
+                sessionize(
+                    mine,
+                    their_clicks,
+                    &mut tally,
+                    first_day,
+                    days,
+                    organic,
+                    &category_rank,
+                );
+            }
             tally
         })
         .reduce(empty_tally, |mut a, mut b| {
@@ -1002,7 +1036,7 @@ fn sessionize(
     organic: usize,
     category_rank: &[u16],
 ) {
-    let mut sums: Vec<(u16, u64)> = Vec::new();
+    let mut sums = std::mem::take(&mut tally.sums);
     let mut click_at = 0;
     let mut at = 0;
     while at < events.len() {
@@ -1087,6 +1121,7 @@ fn sessionize(
         }
         at = end;
     }
+    tally.sums = sums;
 }
 
 #[inline]
