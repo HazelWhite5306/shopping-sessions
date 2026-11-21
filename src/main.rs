@@ -37,6 +37,8 @@ const SESSION_GAP: i64 = 1_800_000;
 const LATE: i64 = DAY;
 const MAX_PRICE: u64 = 10_000_000;
 const CHUNK: usize = 2 << 20;
+/// I/O threads for the loaders read mode; they mostly wait on the disk.
+const LOADERS: usize = 16;
 /// Hash shards for event IDs and user IDs, and buckets for people.
 const SHARDS: usize = 64;
 const BUCKETS: usize = 256;
@@ -214,25 +216,12 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// How input pages are brought in: "seq" (page faults with sequential
-/// read-ahead), "willneed" (ask the kernel to read every file at once), or
-/// "populate" (each parse thread reads its chunk fully before parsing it).
+/// How input pages are brought in: "willneed" (ask the kernel to read every
+/// file at once), "loaders" (I/O threads read each piece just ahead of the
+/// parsers, many reads in flight), "both", or "none".
 fn read_mode() -> &'static str {
     static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    MODE.get_or_init(|| std::env::var("SESSIONS_READ").unwrap_or_else(|_| "willneed".into()))
-}
-
-/// Reads a chunk's pages in with one blocking call, so many chunks load in
-/// parallel at a high disk queue depth.
-fn populate(chunk: &[u8]) {
-    if read_mode() != "populate" || chunk.is_empty() {
-        return;
-    }
-    let start = chunk.as_ptr() as usize & !4095;
-    let end = chunk.as_ptr() as usize + chunk.len();
-    unsafe {
-        libc::madvise(start as *mut libc::c_void, end - start, 22 /* MADV_POPULATE_READ */);
-    }
+    MODE.get_or_init(|| std::env::var("SESSIONS_READ").unwrap_or_else(|_| "both".into()))
 }
 
 fn map(path: &Path) -> Option<Mmap> {
@@ -241,13 +230,10 @@ fn map(path: &Path) -> Option<Mmap> {
         return None;
     }
     let map = unsafe { Mmap::map(&file) }.ok()?;
-    match read_mode() {
-        "willneed" => {
-            let _ = map.advise(memmap2::Advice::WillNeed);
-        }
-        _ => {
-            let _ = map.advise(memmap2::Advice::Sequential);
-        }
+    if matches!(read_mode(), "willneed" | "both") {
+        let _ = map.advise(memmap2::Advice::WillNeed);
+    } else {
+        let _ = map.advise(memmap2::Advice::Sequential);
     }
     Some(map)
 }
@@ -256,29 +242,99 @@ fn map_all(files: &[PathBuf]) -> Vec<Mmap> {
     files.par_iter().filter_map(|path| map(path)).collect()
 }
 
-/// Splits every file, minus its header line, into chunks that start and end
-/// at line boundaries.
-fn chunks(maps: &[Mmap]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    for map in maps {
-        let data: &[u8] = map;
-        let Some(header_end) = memchr::memchr(b'\n', data) else {
-            continue;
-        };
-        let mut start = header_end + 1;
-        while start < data.len() {
-            let mut end = (start + CHUNK).min(data.len());
-            if end < data.len() {
-                end = match memchr::memchr(b'\n', &data[end..]) {
-                    Some(at) => end + at + 1,
-                    None => data.len(),
-                };
-            }
-            out.push(&data[start..end]);
-            start = end;
+/// Which table a piece of input belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Event,
+    Click,
+    Link,
+}
+
+/// A slice of one input file: the lines whose first byte lies in
+/// `from..to`. Each parse task finds its own line boundaries, so nothing
+/// touches the files before the parsers and loaders start.
+#[derive(Clone, Copy)]
+struct Piece {
+    kind: Kind,
+    map: usize,
+    from: usize,
+    to: usize,
+}
+
+fn pieces(maps: &[Mmap], kind: Kind, out: &mut Vec<Piece>) {
+    for (at, map) in maps.iter().enumerate() {
+        let mut from = 0;
+        while from < map.len() {
+            let to = (from + CHUNK).min(map.len());
+            out.push(Piece {
+                kind,
+                map: at,
+                from,
+                to,
+            });
+            from = to;
         }
     }
-    out
+}
+
+/// The bytes of the lines whose first byte is in `from..to`, without the
+/// file's header line. Neighbouring pieces split at the same line starts.
+fn lines_of(data: &[u8], from: usize, to: usize) -> &[u8] {
+    // The first line start at or after `at`.
+    let line_start = |at: usize| -> usize {
+        if at == 0 {
+            0
+        } else if at >= data.len() {
+            data.len()
+        } else {
+            match memchr::memchr(b'\n', &data[at - 1..]) {
+                Some(offset) => at + offset,
+                None => data.len(),
+            }
+        }
+    };
+    let mut start = line_start(from);
+    let end = line_start(to);
+    if start == 0 {
+        start = memchr::memchr(b'\n', data).map_or(data.len(), |at| at + 1);
+    }
+    if start >= end { &data[..0] } else { &data[start..end] }
+}
+
+/// Starts I/O threads that read the pieces into the page cache in order,
+/// many at once, just ahead of the parsers that take them in the same order.
+fn start_loaders(blocks: Vec<(usize, usize)>) {
+    if !matches!(read_mode(), "loaders" | "both") || blocks.is_empty() {
+        return;
+    }
+    let blocks = std::sync::Arc::new(blocks);
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..LOADERS {
+        let blocks = blocks.clone();
+        let next = next.clone();
+        std::thread::spawn(move || {
+            loop {
+                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&(address, len)) = blocks.get(at) else {
+                    break;
+                };
+                let start = address & !4095;
+                let end = address + len;
+                // MADV_POPULATE_READ (Linux 5.14+); on older kernels, touch
+                // one byte per page instead.
+                let done = unsafe {
+                    libc::madvise(start as *mut libc::c_void, end - start, 22) == 0
+                };
+                if !done {
+                    let mut page = address;
+                    while page < end {
+                        unsafe { std::ptr::read_volatile(page as *const u8) };
+                        page = (page & !4095) + 4096;
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// The rows of a clean two-column lookup file, without its header.
@@ -642,136 +698,81 @@ fn run(data: &Path, output: &Path, start: Instant) {
     let event_maps = map_all(&csv_files(&data.join("events")));
     let click_maps = map_all(&csv_files(&data.join("clicks")));
     let link_maps = map_all(&csv_files(&data.join("links")));
-    let event_chunks = chunks(&event_maps);
-    let click_chunks = chunks(&click_maps);
-    let link_chunks = chunks(&link_maps);
-    log(start, "mapped");
-    if std::env::var("SESSIONS_EXPERIMENT").as_deref() == Ok("scan") {
-        let lines: usize = event_chunks
-            .par_iter()
-            .chain(click_chunks.par_iter())
-            .map(|chunk| memchr::memchr_iter(b'\n', chunk).count())
-            .sum();
-        log(start, &format!("scanned {lines} lines"));
-        let fields: usize = event_chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut n = 0;
-                csv::for_records::<7>(chunk, |_| n += 1);
-                n
-            })
-            .sum();
-        log(start, &format!("split {fields} event lines"));
-        let valid: usize = event_chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut n = 0;
-                let mut clock = ts::Parser::new();
-                csv::for_records::<7>(chunk, |fields| {
-                    if let Some(event) = parse_event(fields, &context, &mut clock) {
-                        n += usize::from(event.price_category != INVALID) + (event.event_id.hash() as usize & 1);
-                    }
-                });
-                n
-            })
-            .sum();
-        log(start, &format!("parsed {valid} without storing"));
-        type Probe = fn([&[u8]; 7], &Context, &mut ts::Parser) -> u64;
-        let probes: [(&str, Probe); 5] = [
-            ("nothing", |f, _, _| f[0].len() as u64),
-            ("ingest", |f, _, c| c.parse(f[3]).unwrap_or(0) as u64),
-            ("ts", |f, _, c| c.parse(f[2]).unwrap_or(0) as u64),
-            ("keys", |f, _, _| Key::new(f[0]).hash() ^ Key::new(f[1]).hash()),
-            ("product", |f, x, _| u64::from(x.products.get(f[5]).unwrap_or(0))),
-        ];
-        for (name, probe) in probes {
-            let total: u64 = event_chunks
-                .par_iter()
-                .map(|chunk| {
-                    let mut n = 0u64;
-                    let mut clock = ts::Parser::new();
-                    csv::for_records::<7>(chunk, |fields| {
-                        n = n.wrapping_add(probe(fields, &context, &mut clock));
-                    });
-                    n
-                })
-                .sum();
-            log(start, &format!("probe {name} {}", total & 1));
+    let mut work: Vec<Piece> = Vec::new();
+    pieces(&event_maps, Kind::Event, &mut work);
+    pieces(&click_maps, Kind::Click, &mut work);
+    pieces(&link_maps, Kind::Link, &mut work);
+    let bytes_of = |piece: &Piece| -> &[u8] {
+        match piece.kind {
+            Kind::Event => &event_maps[piece.map],
+            Kind::Click => &click_maps[piece.map],
+            Kind::Link => &link_maps[piece.map],
         }
-        let stored: usize = event_chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut shards: Vec<Vec<EventCopy>> = shard_vecs(SHARDS, chunk.len() / 70 / SHARDS + 16);
-                let mut clock = ts::Parser::new();
-                csv::for_records::<7>(chunk, |fields| {
-                    if let Some(event) = parse_event(fields, &context, &mut clock) {
-                        shards[shard(event.event_id.hash())].push(event);
-                    }
-                });
-                shards.iter().map(Vec::len).sum::<usize>()
-            })
-            .sum();
-        log(start, &format!("parsed and stored {stored}"));
-        std::process::exit(0);
-    }
-
-    // 1. Parse each chunk straight into shards: events by event ID, clicks by
-    //    user ID.
-    let (events, (clicks, links)) = rayon::join(
-        || {
-            event_chunks
-                .par_iter()
-                .map(|chunk| {
-                    let mut shards: Vec<Vec<EventCopy>> =
-                        shard_vecs(SHARDS, chunk.len() / 70 / SHARDS * 5 / 4 + 64);
-                    populate(chunk);
-                    let mut clock = ts::Parser::new();
-                    csv::for_records::<7>(chunk, |fields| {
-                        if let Some(event) = parse_event(fields, &context, &mut clock) {
-                            shards[shard(event.event_id.hash())].push(event);
-                        }
-                    });
-                    shards
-                })
-                .collect::<Vec<_>>()
-        },
-        || {
-            rayon::join(
-                || {
-                    click_chunks
-                        .par_iter()
-                        .map(|chunk| {
-                            let mut shards: Vec<Vec<ValidClick>> =
-                                shard_vecs(SHARDS, chunk.len() / 45 / SHARDS * 5 / 4 + 64);
-                            populate(chunk);
-                            let mut clock = ts::Parser::new();
-                            csv::for_records::<4>(chunk, |fields| {
-                                if let Some(click) = parse_click(fields, &context, &mut clock) {
-                                    shards[shard(click.user_id.hash())].push(click);
-                                }
-                            });
-                            shards
-                        })
-                        .collect::<Vec<_>>()
-                },
-                || {
-                    link_chunks
-                        .par_iter()
-                        .map(|chunk| {
-                            let mut rows = Vec::new();
-                            csv::for_records::<2>(chunk, |[a, b]| {
-                                if !a.is_empty() && !b.is_empty() {
-                                    rows.push([a, b]);
-                                }
-                            });
-                            rows
-                        })
-                        .flatten()
-                        .collect::<Vec<[&[u8]; 2]>>()
-                },
-            )
-        },
+    };
+    start_loaders(
+        work.iter()
+            .map(|piece| (bytes_of(piece).as_ptr() as usize + piece.from, piece.to - piece.from))
+            .collect(),
     );
+    log(start, "mapped");
+
+    // 1. Parse the pieces in order from a shared queue, straight into shards:
+    //    events by event ID, clicks by user ID.
+    type Parsed<'m> = (Vec<Vec<Vec<EventCopy>>>, Vec<Vec<Vec<ValidClick>>>, Vec<[&'m [u8]; 2]>);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = rayon::current_num_threads();
+    let parsed: Vec<Parsed> = (0..workers)
+        .into_par_iter()
+        .map(|_| {
+            let (mut events, mut clicks, mut links): Parsed = (Vec::new(), Vec::new(), Vec::new());
+            let mut clock = ts::Parser::new();
+            loop {
+                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(piece) = work.get(at) else {
+                    break;
+                };
+                let chunk = lines_of(bytes_of(piece), piece.from, piece.to);
+                match piece.kind {
+                    Kind::Event => {
+                        let mut shards: Vec<Vec<EventCopy>> =
+                            shard_vecs(SHARDS, chunk.len() / 70 / SHARDS * 5 / 4 + 64);
+                        csv::for_records::<7>(chunk, |fields| {
+                            if let Some(event) = parse_event(fields, &context, &mut clock) {
+                                shards[shard(event.event_id.hash())].push(event);
+                            }
+                        });
+                        events.push(shards);
+                    }
+                    Kind::Click => {
+                        let mut shards: Vec<Vec<ValidClick>> =
+                            shard_vecs(SHARDS, chunk.len() / 45 / SHARDS * 5 / 4 + 64);
+                        csv::for_records::<4>(chunk, |fields| {
+                            if let Some(click) = parse_click(fields, &context, &mut clock) {
+                                shards[shard(click.user_id.hash())].push(click);
+                            }
+                        });
+                        clicks.push(shards);
+                    }
+                    Kind::Link => {
+                        csv::for_records::<2>(chunk, |[a, b]| {
+                            if !a.is_empty() && !b.is_empty() {
+                                links.push([a, b]);
+                            }
+                        });
+                    }
+                }
+            }
+            (events, clicks, links)
+        })
+        .collect();
+    let mut events = Vec::new();
+    let mut clicks = Vec::new();
+    let mut links = Vec::new();
+    for (mut e, mut c, mut l) in parsed {
+        events.append(&mut e);
+        clicks.append(&mut c);
+        links.append(&mut l);
+    }
     log(start, "parsed");
 
     // 2. Dedup events per shard, reading each chunk's part in place; keep
