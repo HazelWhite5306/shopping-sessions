@@ -382,12 +382,12 @@ struct Context<'a> {
 
 /// Parses an event line; returns the copy and its event-ID hash.
 #[inline]
-fn parse_event(line: &[u8], context: &Context) -> Option<EventCopy> {
-    let [event_id, user_id, ts_field, ingest_field, kind, product, price] = csv::split::<7>(line)?;
+fn parse_event(fields: [&[u8]; 7], context: &Context, clock: &mut ts::Parser) -> Option<EventCopy> {
+    let [event_id, user_id, ts_field, ingest_field, kind, product, price] = fields;
     if event_id.is_empty() {
         return None;
     }
-    let ingest = ts::parse(ingest_field);
+    let ingest = clock.parse(ingest_field);
     let mut valid = !user_id.is_empty() && !product.is_empty() && ingest.is_some();
     let ingest = ingest.unwrap_or(i64::MAX);
     let mut price_cents = 0;
@@ -401,7 +401,7 @@ fn parse_event(line: &[u8], context: &Context) -> Option<EventCopy> {
     }
     let mut ts = 0;
     if valid {
-        match ts::parse(ts_field) {
+        match clock.parse(ts_field) {
             Some(t) if t >= context.window_start && t < context.window_end => ts = t,
             _ => valid = false,
         }
@@ -429,13 +429,13 @@ fn parse_event(line: &[u8], context: &Context) -> Option<EventCopy> {
 }
 
 #[inline]
-fn parse_click(line: &[u8], context: &Context) -> Option<ValidClick> {
-    let [click_id, user_id, campaign, ts_field] = csv::split::<4>(line)?;
+fn parse_click(fields: [&[u8]; 4], context: &Context, clock: &mut ts::Parser) -> Option<ValidClick> {
+    let [click_id, user_id, campaign, ts_field] = fields;
     if click_id.is_empty() || user_id.is_empty() {
         return None;
     }
     let campaign = context.campaigns.get(campaign)?;
-    let ts = ts::parse(ts_field)?;
+    let ts = clock.parse(ts_field)?;
     if ts < context.window_start - WEEK || ts >= context.window_end {
         return None;
     }
@@ -565,6 +565,24 @@ fn run(data: &Path, output: &Path, start: Instant) {
     let click_chunks = chunks(&click_maps);
     let link_chunks = chunks(&link_maps);
     log(start, "mapped");
+    if std::env::var("SESSIONS_EXPERIMENT").as_deref() == Ok("scan") {
+        let lines: usize = event_chunks
+            .par_iter()
+            .chain(click_chunks.par_iter())
+            .map(|chunk| memchr::memchr_iter(b'\n', chunk).count())
+            .sum();
+        log(start, &format!("scanned {lines} lines"));
+        let fields: usize = event_chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut n = 0;
+                csv::for_records::<7>(chunk, |_| n += 1);
+                n
+            })
+            .sum();
+        log(start, &format!("split {fields} event lines"));
+        std::process::exit(0);
+    }
 
     // 1. Parse each chunk straight into shards: events by event ID, clicks by
     //    user ID.
@@ -575,8 +593,9 @@ fn run(data: &Path, output: &Path, start: Instant) {
                 .map(|chunk| {
                     let mut shards: Vec<Vec<EventCopy>> =
                         shard_vecs(SHARDS, chunk.len() / 70 / SHARDS + 16);
-                    csv::for_lines(chunk, |line| {
-                        if let Some(event) = parse_event(line, &context) {
+                    let mut clock = ts::Parser::new();
+                    csv::for_records::<7>(chunk, |fields| {
+                        if let Some(event) = parse_event(fields, &context, &mut clock) {
                             shards[shard(event.event_id.hash())].push(event);
                         }
                     });
@@ -592,8 +611,9 @@ fn run(data: &Path, output: &Path, start: Instant) {
                         .map(|chunk| {
                             let mut shards: Vec<Vec<ValidClick>> =
                                 shard_vecs(SHARDS, chunk.len() / 45 / SHARDS + 16);
-                            csv::for_lines(chunk, |line| {
-                                if let Some(click) = parse_click(line, &context) {
+                            let mut clock = ts::Parser::new();
+                            csv::for_records::<4>(chunk, |fields| {
+                                if let Some(click) = parse_click(fields, &context, &mut clock) {
                                     shards[shard(click.user_hash)].push(click);
                                 }
                             });
@@ -606,11 +626,8 @@ fn run(data: &Path, output: &Path, start: Instant) {
                         .par_iter()
                         .map(|chunk| {
                             let mut rows = Vec::new();
-                            csv::for_lines(chunk, |line| {
-                                if let Some([a, b]) = csv::split::<2>(line)
-                                    && !a.is_empty()
-                                    && !b.is_empty()
-                                {
+                            csv::for_records::<2>(chunk, |[a, b]| {
+                                if !a.is_empty() && !b.is_empty() {
                                     rows.push([a, b]);
                                 }
                             });

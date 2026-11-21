@@ -70,6 +70,87 @@ fn civil(s: &[u8]) -> Option<i64> {
     Some(((days * 24 + hour) * 60 + minute) * MINUTE + second * SECOND)
 }
 
+/// `parse` with a one-entry cache of the last valid `YYYY-MM-DD`, which
+/// repeats on almost every row of a 14-day window.
+pub struct Parser {
+    date: [u8; 10],
+    days: i64,
+}
+
+impl Parser {
+    pub fn new() -> Self {
+        Parser {
+            date: [0; 10],
+            days: i64::MIN,
+        }
+    }
+
+    /// The UTC-naive milliseconds of `YYYY-MM-DDTHH:MM:SS` at the start of
+    /// `s` (19 bytes or more), or None if any part is invalid.
+    #[inline]
+    fn civil(&mut self, s: &[u8]) -> Option<i64> {
+        let days = if self.days != i64::MIN && s[..10] == self.date {
+            self.days
+        } else {
+            if s[4] != b'-' || s[7] != b'-' {
+                return None;
+            }
+            let year = d2(s, 0)? * 100 + d2(s, 2)?;
+            let month = d2(s, 5)?;
+            let day = d2(s, 8)?;
+            if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+                return None;
+            }
+            let days = days_from_civil(year, month, day);
+            self.date.copy_from_slice(&s[..10]);
+            self.days = days;
+            days
+        };
+        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let hour = d2(s, 11)?;
+        let minute = d2(s, 14)?;
+        let second = d2(s, 17)?;
+        if hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        Some(((days * 24 + hour) * 60 + minute) * MINUTE + second * SECOND)
+    }
+
+    #[inline]
+    pub fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        let n = s.len();
+        if n == 0 {
+            return None;
+        }
+        if n != 20 && n != 25 {
+            return parse(s);
+        }
+        if n == 20 {
+            if s[19] != b'Z' {
+                return parse(s);
+            }
+            return self.civil(s);
+        }
+        let sign = match s[19] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return parse(s),
+        };
+        if s[22] != b':' {
+            return None;
+        }
+        let oh = d2(s, 20)?;
+        let om = d2(s, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let local = self.civil(s)?;
+        Some(local - sign * (oh * 60 + om) * MINUTE)
+    }
+}
+
 #[inline]
 pub fn parse(s: &[u8]) -> Option<i64> {
     let n = s.len();
@@ -163,5 +244,32 @@ mod tests {
             assert_eq!(parse(bad), None, "{}", String::from_utf8_lossy(bad));
         }
         assert!(parse(b"2028-02-29T00:00:00Z").is_some());
+    }
+
+    #[test]
+    fn cached_parser_matches() {
+        let seeds: [&[u8]; 6] = [
+            b"2026-10-03T23:58:10Z",
+            b"2026-10-03T19:58:10-04:00",
+            b"2028-02-29T00:00:00+12:00",
+            b"1791071890000",
+            b"2027-02-28T23:59:59Z",
+            b"2026-12-31T00:00:00-00:00",
+        ];
+        let alphabet = b"0123456789-T:Z+zt .";
+        let mut state: u64 = 42;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let mut parser = Parser::new();
+        for _ in 0..200_000 {
+            let mut s = seeds[next() % seeds.len()].to_vec();
+            for _ in 0..next() % 3 {
+                let at = next() % s.len();
+                s[at] = alphabet[next() % alphabet.len()];
+            }
+            assert_eq!(parser.parse(&s), parse(&s), "{}", String::from_utf8_lossy(&s));
+        }
     }
 }

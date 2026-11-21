@@ -22,7 +22,25 @@ pub struct Key {
 impl Key {
     #[inline]
     pub fn new(s: &[u8]) -> Key {
-        if s.len() <= 15 {
+        let len = s.len();
+        let pointer = s.as_ptr();
+        // One 16-byte load when it stays inside the field's own page, which is
+        // mapped because the field is; bytes past the field are masked off.
+        if len <= 15 && (pointer as usize & 4095) <= 4096 - 16 {
+            let raw = unsafe { std::ptr::read_unaligned(pointer as *const u128) };
+            let bytes = u128::from_be(raw);
+            let kept = if len == 0 {
+                0
+            } else {
+                bytes & (!0u128 << (128 - 8 * len))
+            };
+            let value = kept | len as u128;
+            return Key {
+                hi: (value >> 64) as u64,
+                lo: value as u64,
+            };
+        }
+        if len <= 15 {
             let mut bytes = [0u8; 16];
             bytes[..s.len()].copy_from_slice(s);
             bytes[15] = s.len() as u8;
@@ -129,6 +147,23 @@ mod tests {
                 }
             }
             assert_eq!(Key::new(a).to_vec(), a.to_vec());
+        }
+    }
+
+    #[test]
+    fn fast_and_slow_loads_agree() {
+        // Fields at every offset across a page boundary take both load paths.
+        let buffer: Vec<u8> = (0..3 * 4096).map(|i| b"azAZ09_ ,"[i % 9]).collect();
+        for start in 4096 - 40..4096 + 8 {
+            for len in 0..=15 {
+                let field = &buffer[start..start + len];
+                let mut bytes = [0u8; 16];
+                bytes[..len].copy_from_slice(field);
+                bytes[15] = len as u8;
+                let want = u128::from_be_bytes(bytes);
+                let key = Key::new(field);
+                assert_eq!((u128::from(key.hi) << 64) | u128::from(key.lo), want);
+            }
         }
     }
 
