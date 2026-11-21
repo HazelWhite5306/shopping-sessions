@@ -663,6 +663,28 @@ fn run(data: &Path, output: &Path, start: Instant) {
             })
             .sum();
         log(start, &format!("parsed {valid} without storing"));
+        type Probe = fn([&[u8]; 7], &Context, &mut ts::Parser) -> u64;
+        let probes: [(&str, Probe); 5] = [
+            ("nothing", |f, _, _| f[0].len() as u64),
+            ("ingest", |f, _, c| c.parse(f[3]).unwrap_or(0) as u64),
+            ("ts", |f, _, c| c.parse(f[2]).unwrap_or(0) as u64),
+            ("keys", |f, _, _| Key::new(f[0]).hash() ^ Key::new(f[1]).hash()),
+            ("product", |f, x, _| u64::from(x.products.get(f[5]).unwrap_or(0))),
+        ];
+        for (name, probe) in probes {
+            let total: u64 = event_chunks
+                .par_iter()
+                .map(|chunk| {
+                    let mut n = 0u64;
+                    let mut clock = ts::Parser::new();
+                    csv::for_records::<7>(chunk, |fields| {
+                        n = n.wrapping_add(probe(fields, &context, &mut clock));
+                    });
+                    n
+                })
+                .sum();
+            log(start, &format!("probe {name} {}", total & 1));
+        }
         let stored: usize = event_chunks
             .par_iter()
             .map(|chunk| {
