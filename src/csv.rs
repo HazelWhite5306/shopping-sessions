@@ -229,15 +229,17 @@ pub fn for_records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u
         let mut fields: [&'a [u8]; N] = [&data[..0]; N];
         let mut wrapped = 0u32;
         let mut start = line_start;
+        let base = data.as_ptr();
         for at in 0..N {
             let stop = if at + 1 < N { commas[at] } else { end };
-            let field = &data[start..stop];
-            if field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' {
-                wrapped += 1;
-                fields[at] = &field[1..field.len() - 1];
-            } else {
-                fields[at] = field;
-            }
+            // line_start <= commas[0] < ... < commas[N - 2] < end <= data.len(),
+            // all found by the scan, so every field lies inside `data`.
+            let len = stop - start;
+            let wraps = len >= 2
+                && unsafe { *base.add(start) == b'"' && *base.add(stop - 1) == b'"' };
+            wrapped += u32::from(wraps);
+            let (from, to) = if wraps { (start + 1, stop - 1) } else { (start, stop) };
+            fields[at] = unsafe { std::slice::from_raw_parts(base.add(from), to - from) };
             start = stop + 1;
         }
         if quotes == 2 * wrapped {
