@@ -49,8 +49,12 @@ fn open(dir: &Path, part: usize, schema: &str) -> Writer {
     fs::create_dir_all(dir).expect("create output folder");
     let file = File::create(dir.join(format!("part-{part}.parquet"))).expect("create parquet file");
     let schema = Arc::new(parse_message_type(schema).expect("schema"));
-    SerializedFileWriter::new(BufWriter::with_capacity(1 << 22, file), schema, properties())
-        .expect("parquet writer")
+    SerializedFileWriter::new(
+        BufWriter::with_capacity(1 << 22, file),
+        schema,
+        properties(),
+    )
+    .expect("parquet writer")
 }
 
 fn bytes(values: impl Iterator<Item = Vec<u8>>) -> Vec<ByteArray> {

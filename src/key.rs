@@ -82,7 +82,10 @@ impl Key {
     pub fn hash(self) -> u64 {
         if self.is_inline() {
             fold(
-                fold(self.hi ^ 0xe703_7ed1_a0b4_28db, self.lo ^ 0x8ebc_6af0_9c88_c6e3),
+                fold(
+                    self.hi ^ 0xe703_7ed1_a0b4_28db,
+                    self.lo ^ 0x8ebc_6af0_9c88_c6e3,
+                ),
                 0xa076_1d64_78bd_642f,
             )
         } else {
@@ -133,8 +136,20 @@ mod tests {
     #[test]
     fn order_and_equality() {
         let words: Vec<&[u8]> = vec![
-            b"", b"a", b"a\0", b"a\0z", b"ab", b"U1", b"u1", b" u1", b"u1 ", b"\xff",
-            b"exactly15bytes!", b"sixteen_bytes_ab", b"sixteen_bytes_ac", b"sixteen_bytes_a",
+            b"",
+            b"a",
+            b"a\0",
+            b"a\0z",
+            b"ab",
+            b"U1",
+            b"u1",
+            b" u1",
+            b"u1 ",
+            b"\xff",
+            b"exactly15bytes!",
+            b"sixteen_bytes_ab",
+            b"sixteen_bytes_ac",
+            b"sixteen_bytes_a",
             b"a much longer identifier than sixteen",
         ];
         for a in &words {

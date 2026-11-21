@@ -91,7 +91,10 @@ fn main() {
     }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
-    let threads = std::env::var("NCPU")
+    // SESSIONS_THREADS overrides the scorer's NCPU, for experiments such as
+    // one thread per physical core.
+    let threads = std::env::var("SESSIONS_THREADS")
+        .or_else(|_| std::env::var("NCPU"))
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from));
@@ -233,9 +236,10 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
             .map(|entry| entry.path())
             .filter(|path| {
                 path.is_file()
-                    && path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
-                        name.ends_with(".csv") && !name.starts_with('.')
-                    })
+                    && path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| name.ends_with(".csv") && !name.starts_with('.'))
             })
             .collect(),
         Err(_) => Vec::new(),
@@ -326,7 +330,11 @@ fn lines_of(data: &[u8], from: usize, to: usize) -> &[u8] {
     if start == 0 {
         start = memchr::memchr(b'\n', data).map_or(data.len(), |at| at + 1);
     }
-    if start >= end { &data[..0] } else { &data[start..end] }
+    if start >= end {
+        &data[..0]
+    } else {
+        &data[start..end]
+    }
 }
 
 /// Starts I/O threads that read the pieces into the page cache in order,
@@ -350,9 +358,8 @@ fn start_loaders(blocks: Vec<(usize, usize)>) {
                 let end = address + len;
                 // MADV_POPULATE_READ (Linux 5.14+); on older kernels, touch
                 // one byte per page instead.
-                let done = unsafe {
-                    libc::madvise(start as *mut libc::c_void, end - start, 22) == 0
-                };
+                let done =
+                    unsafe { libc::madvise(start as *mut libc::c_void, end - start, 22) == 0 };
                 if !done {
                     let mut page = address;
                     while page < end {
@@ -545,7 +552,15 @@ struct Context<'a> {
 /// Parses an event line; returns the copy and its event-ID hash.
 #[inline]
 fn parse_event(fields: [&[u8]; 7], context: &Context, clock: &mut ts::Parser) -> Option<EventCopy> {
-    let [event_id, user_id, ts_field, ingest_field, kind, product, price] = fields;
+    let [
+        event_id,
+        user_id,
+        ts_field,
+        ingest_field,
+        kind,
+        product,
+        price,
+    ] = fields;
     if event_id.is_empty() {
         return None;
     }
@@ -571,7 +586,11 @@ fn parse_event(fields: [&[u8]; 7], context: &Context, clock: &mut ts::Parser) ->
     if valid && ingest - ts > LATE {
         valid = false;
     }
-    let price_category = if valid {
+    // Only a purchase's category is ever used (top_category sums purchase
+    // prices), so views and carts skip the product lookup.
+    let price_category = if !valid {
+        INVALID
+    } else if price_cents > 0 {
         pack(
             price_cents,
             context
@@ -580,7 +599,7 @@ fn parse_event(fields: [&[u8]; 7], context: &Context, clock: &mut ts::Parser) ->
                 .unwrap_or(context.unknown_category),
         )
     } else {
-        INVALID
+        pack(0, 0)
     };
     Some(EventCopy {
         event_id: Key::new(event_id),
@@ -592,7 +611,11 @@ fn parse_event(fields: [&[u8]; 7], context: &Context, clock: &mut ts::Parser) ->
 }
 
 #[inline]
-fn parse_click(fields: [&[u8]; 4], context: &Context, clock: &mut ts::Parser) -> Option<ValidClick> {
+fn parse_click(
+    fields: [&[u8]; 4],
+    context: &Context,
+    clock: &mut ts::Parser,
+) -> Option<ValidClick> {
     let [click_id, user_id, campaign, ts_field] = fields;
     if click_id.is_empty() || user_id.is_empty() {
         return None;
@@ -739,14 +762,23 @@ fn run(data: &Path, output: &Path, start: Instant) {
     };
     start_loaders(
         work.iter()
-            .map(|piece| (bytes_of(piece).as_ptr() as usize + piece.from, piece.to - piece.from))
+            .map(|piece| {
+                (
+                    bytes_of(piece).as_ptr() as usize + piece.from,
+                    piece.to - piece.from,
+                )
+            })
             .collect(),
     );
     log(start, "mapped");
 
     // 1. Parse the pieces in order from a shared queue, straight into shards:
     //    events by event ID, clicks by user ID.
-    type Parsed<'m> = (Vec<Vec<Vec<EventCopy>>>, Vec<Vec<Vec<ValidClick>>>, Vec<[&'m [u8]; 2]>);
+    type Parsed<'m> = (
+        Vec<Vec<Vec<EventCopy>>>,
+        Vec<Vec<Vec<ValidClick>>>,
+        Vec<[&'m [u8]; 2]>,
+    );
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = rayon::current_num_threads();
     let parsed: Vec<Parsed> = (0..workers)
@@ -1016,79 +1048,90 @@ fn run(data: &Path, output: &Path, start: Instant) {
         stamp: vec![u64::MAX; campaign_slots],
         session: 0,
     };
-    let tally = (0..BUCKETS)
+    // One tally per worker, each pulling buckets from a shared queue: far
+    // fewer campaign tables to zero and merge than one per rayon split.
+    let next_bucket = std::sync::atomic::AtomicUsize::new(0);
+    let tally = (0..rayon::current_num_threads())
         .into_par_iter()
-        .fold(empty_tally, |mut tally, at| {
-            // Rows carry bucket-local person numbers: count, then place each
-            // row in its person's range, with small arrays that stay in cache.
-            let people = bucket_people[at].len();
-            let mut starts = vec![0usize; people + 1];
-            for (part, _) in &regrouped {
-                for event in &part[at] {
-                    starts[event.person as usize + 1] += 1;
+        .map(|_| {
+            let mut tally = empty_tally();
+            loop {
+                let at = next_bucket.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if at >= BUCKETS {
+                    break;
                 }
-            }
-            for index in 0..people {
-                starts[index + 1] += starts[index];
-            }
-            let total = starts[people];
-            let mut events: Vec<PersonEvent> = Vec::with_capacity(total);
-            let mut cursor = starts.clone();
-            unsafe {
-                let target = events.as_mut_ptr();
+                // Rows carry bucket-local person numbers: count, then place each
+                // row in its person's range, with small arrays that stay in cache.
+                let people = bucket_people[at].len();
+                let mut starts = vec![0usize; people + 1];
                 for (part, _) in &regrouped {
                     for event in &part[at] {
-                        let index = event.person as usize;
-                        target.add(cursor[index]).write(*event);
-                        cursor[index] += 1;
+                        starts[event.person as usize + 1] += 1;
                     }
                 }
-                events.set_len(total);
-            }
-            let mut click_starts = vec![0usize; people + 1];
-            for (_, part) in &regrouped {
-                for click in &part[at] {
-                    click_starts[click.person as usize + 1] += 1;
+                for index in 0..people {
+                    starts[index + 1] += starts[index];
                 }
-            }
-            for index in 0..people {
-                click_starts[index + 1] += click_starts[index];
-            }
-            let click_total = click_starts[people];
-            let mut clicks: Vec<PersonClick> = Vec::with_capacity(click_total);
-            let mut cursor = click_starts.clone();
-            unsafe {
-                let target = clicks.as_mut_ptr();
+                let total = starts[people];
+                let mut events: Vec<PersonEvent> = Vec::with_capacity(total);
+                let mut cursor = starts.clone();
+                unsafe {
+                    let target = events.as_mut_ptr();
+                    for (part, _) in &regrouped {
+                        for event in &part[at] {
+                            let index = event.person as usize;
+                            target.add(cursor[index]).write(*event);
+                            cursor[index] += 1;
+                        }
+                    }
+                    events.set_len(total);
+                }
+                let mut click_starts = vec![0usize; people + 1];
                 for (_, part) in &regrouped {
                     for click in &part[at] {
-                        let index = click.person as usize;
-                        target.add(cursor[index]).write(*click);
-                        cursor[index] += 1;
+                        click_starts[click.person as usize + 1] += 1;
                     }
                 }
-                clicks.set_len(click_total);
-            }
-            // Each person's few events by ts, and clicks by (ts, click_id).
-            for index in 0..people {
-                if starts[index] == starts[index + 1] {
-                    // A person with only clicks or links has no sessions.
-                    continue;
+                for index in 0..people {
+                    click_starts[index + 1] += click_starts[index];
                 }
-                let mine = &mut events[starts[index]..starts[index + 1]];
-                mine.sort_unstable_by_key(|e| e.ts);
-                let their_clicks = &mut clicks[click_starts[index]..click_starts[index + 1]];
-                their_clicks.sort_unstable_by(|a, b| (a.ts, a.click_id).cmp(&(b.ts, b.click_id)));
-                sessionize(
-                    mine,
-                    their_clicks,
-                    &mut tally,
-                    first_day,
-                    days,
-                    organic,
-                    &category_rank,
-                    window_start,
-                    bucket_people[at][index],
-                );
+                let click_total = click_starts[people];
+                let mut clicks: Vec<PersonClick> = Vec::with_capacity(click_total);
+                let mut cursor = click_starts.clone();
+                unsafe {
+                    let target = clicks.as_mut_ptr();
+                    for (_, part) in &regrouped {
+                        for click in &part[at] {
+                            let index = click.person as usize;
+                            target.add(cursor[index]).write(*click);
+                            cursor[index] += 1;
+                        }
+                    }
+                    clicks.set_len(click_total);
+                }
+                // Each person's few events by ts, and clicks by (ts, click_id).
+                for index in 0..people {
+                    if starts[index] == starts[index + 1] {
+                        // A person with only clicks or links has no sessions.
+                        continue;
+                    }
+                    let mine = &mut events[starts[index]..starts[index + 1]];
+                    mine.sort_unstable_by_key(|e| e.ts);
+                    let their_clicks = &mut clicks[click_starts[index]..click_starts[index + 1]];
+                    their_clicks
+                        .sort_unstable_by(|a, b| (a.ts, a.click_id).cmp(&(b.ts, b.click_id)));
+                    sessionize(
+                        mine,
+                        their_clicks,
+                        &mut tally,
+                        first_day,
+                        days,
+                        organic,
+                        &category_rank,
+                        window_start,
+                        bucket_people[at][index],
+                    );
+                }
             }
             tally
         })

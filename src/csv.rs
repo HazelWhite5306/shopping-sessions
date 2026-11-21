@@ -221,31 +221,36 @@ pub fn for_records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u
     let mut quotes_before_block = 0u32;
     let mut quotes_at_line_start = 0u32;
 
-    let mut handle = |line_start: usize, end: usize, commas: &[usize; N], count: usize, quotes: u32| {
-        // An empty line is malformed whatever N is.
-        if count != N - 1 || end == line_start {
-            return;
-        }
-        let mut fields: [&'a [u8]; N] = [&data[..0]; N];
-        let mut wrapped = 0u32;
-        let mut start = line_start;
-        let base = data.as_ptr();
-        for at in 0..N {
-            let stop = if at + 1 < N { commas[at] } else { end };
-            // line_start <= commas[0] < ... < commas[N - 2] < end <= data.len(),
-            // all found by the scan, so every field lies inside `data`.
-            let len = stop - start;
-            let wraps = len >= 2
-                && unsafe { *base.add(start) == b'"' && *base.add(stop - 1) == b'"' };
-            wrapped += u32::from(wraps);
-            let (from, to) = if wraps { (start + 1, stop - 1) } else { (start, stop) };
-            fields[at] = unsafe { std::slice::from_raw_parts(base.add(from), to - from) };
-            start = stop + 1;
-        }
-        if quotes == 2 * wrapped {
-            f(fields);
-        }
-    };
+    let mut handle =
+        |line_start: usize, end: usize, commas: &[usize; N], count: usize, quotes: u32| {
+            // An empty line is malformed whatever N is.
+            if count != N - 1 || end == line_start {
+                return;
+            }
+            let mut fields: [&'a [u8]; N] = [&data[..0]; N];
+            let mut wrapped = 0u32;
+            let mut start = line_start;
+            let base = data.as_ptr();
+            for at in 0..N {
+                let stop = if at + 1 < N { commas[at] } else { end };
+                // line_start <= commas[0] < ... < commas[N - 2] < end <= data.len(),
+                // all found by the scan, so every field lies inside `data`.
+                let len = stop - start;
+                let wraps =
+                    len >= 2 && unsafe { *base.add(start) == b'"' && *base.add(stop - 1) == b'"' };
+                wrapped += u32::from(wraps);
+                let (from, to) = if wraps {
+                    (start + 1, stop - 1)
+                } else {
+                    (start, stop)
+                };
+                fields[at] = unsafe { std::slice::from_raw_parts(base.add(from), to - from) };
+                start = stop + 1;
+            }
+            if quotes == 2 * wrapped {
+                f(fields);
+            }
+        };
 
     let mut base = 0;
     while base < n {
@@ -261,9 +266,19 @@ pub fn for_records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u
                 }
                 count += 1;
             } else {
-                let below = if bit == 0 { 0 } else { quote_bits & (u64::MAX >> (64 - bit)) };
+                let below = if bit == 0 {
+                    0
+                } else {
+                    quote_bits & (u64::MAX >> (64 - bit))
+                };
                 let quotes_here = quotes_before_block + below.count_ones();
-                handle(line_start, at, &commas, count, quotes_here - quotes_at_line_start);
+                handle(
+                    line_start,
+                    at,
+                    &commas,
+                    count,
+                    quotes_here - quotes_at_line_start,
+                );
                 quotes_at_line_start = quotes_here;
                 count = 0;
                 line_start = at + 1;
@@ -273,7 +288,13 @@ pub fn for_records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u
         base += 64;
     }
     if line_start < n {
-        handle(line_start, n, &commas, count, quotes_before_block - quotes_at_line_start);
+        handle(
+            line_start,
+            n,
+            &commas,
+            count,
+            quotes_before_block - quotes_at_line_start,
+        );
     }
 }
 
@@ -325,12 +346,16 @@ mod tests {
         let alphabet = b"ab,,\"\"\n\n \r";
         let mut state: u64 = 0x1234_5678_9abc_def0;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as usize
         };
         for round in 0..20000 {
             let len = next() % 400;
-            let mut data: Vec<u8> = (0..len).map(|_| alphabet[next() % alphabet.len()]).collect();
+            let mut data: Vec<u8> = (0..len)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
             // Some rounds use well-formed rows with quoted fields, like the generator.
             if round % 3 == 0 {
                 data.clear();
@@ -344,10 +369,18 @@ mod tests {
                         if quoted {
                             data.push(b'"');
                         }
-                        let width = if next() % 4 == 0 { next() % 300 } else { next() % 12 };
+                        let width = if next() % 4 == 0 {
+                            next() % 300
+                        } else {
+                            next() % 12
+                        };
                         for _ in 0..width {
                             // Rarely a stray quote inside, which makes the line malformed.
-                            let byte = if next() % 400 == 0 { b'"' } else { b"xyz019 "[next() % 7] };
+                            let byte = if next() % 400 == 0 {
+                                b'"'
+                            } else {
+                                b"xyz019 "[next() % 7]
+                            };
                             data.push(byte);
                         }
                         if quoted {
@@ -359,11 +392,36 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(fast::<2>(&data), reference::<2>(&data), "{:?}", String::from_utf8_lossy(&data));
-            assert_eq!(fast::<4>(&data), reference::<4>(&data), "{:?}", String::from_utf8_lossy(&data));
-            assert_eq!(fast::<7>(&data), reference::<7>(&data), "{:?}", String::from_utf8_lossy(&data));
-            assert_eq!(branchy::<4>(&data), reference::<4>(&data), "{:?}", String::from_utf8_lossy(&data));
-            assert_eq!(fast::<1>(&data), reference::<1>(&data), "{:?}", String::from_utf8_lossy(&data));
+            assert_eq!(
+                fast::<2>(&data),
+                reference::<2>(&data),
+                "{:?}",
+                String::from_utf8_lossy(&data)
+            );
+            assert_eq!(
+                fast::<4>(&data),
+                reference::<4>(&data),
+                "{:?}",
+                String::from_utf8_lossy(&data)
+            );
+            assert_eq!(
+                fast::<7>(&data),
+                reference::<7>(&data),
+                "{:?}",
+                String::from_utf8_lossy(&data)
+            );
+            assert_eq!(
+                branchy::<4>(&data),
+                reference::<4>(&data),
+                "{:?}",
+                String::from_utf8_lossy(&data)
+            );
+            assert_eq!(
+                fast::<1>(&data),
+                reference::<1>(&data),
+                "{:?}",
+                String::from_utf8_lossy(&data)
+            );
         }
     }
 

@@ -137,7 +137,8 @@ impl Parser {
         let a = (a & !A_MASK) | (zeros & A_MASK);
         let b = (b & !B_MASK) | (zeros & B_MASK);
         let c = (c & !C_MASK) | (zeros & C_MASK);
-        let not_digit = |x: u64| (x.wrapping_add(0x46 * ONES) | x.wrapping_sub(zeros)) & (0x80 * ONES);
+        let not_digit =
+            |x: u64| (x.wrapping_add(0x46 * ONES) | x.wrapping_sub(zeros)) & (0x80 * ONES);
         if not_digit(a) | not_digit(b) | not_digit(c) != 0 {
             return None;
         }
@@ -334,7 +335,9 @@ mod tests {
         let alphabet = b"0123456789-T:Z+zt ./\xff\x80\xd9\x7f\x00";
         let mut state: u64 = 42;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as usize
         };
         let mut parser = Parser::new();
@@ -344,7 +347,12 @@ mod tests {
                 let at = next() % s.len();
                 s[at] = alphabet[next() % alphabet.len()];
             }
-            assert_eq!(parser.parse(&s), parse(&s), "{}", String::from_utf8_lossy(&s));
+            assert_eq!(
+                parser.parse(&s),
+                parse(&s),
+                "{}",
+                String::from_utf8_lossy(&s)
+            );
         }
     }
 }

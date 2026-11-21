@@ -63,7 +63,10 @@ fn cached_percent(data: &Path) -> (f64, f64) {
         .par_iter()
         .map(|path| resident(path))
         .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-    (100.0 * cached as f64 / total.max(1) as f64, total as f64 / 1e6)
+    (
+        100.0 * cached as f64 / total.max(1) as f64,
+        total as f64 / 1e6,
+    )
 }
 
 /// Reads every input file with parallel 1 MB reads (through the page cache).
@@ -108,9 +111,8 @@ fn read_direct(data: &Path) -> f64 {
             let buffer = unsafe { std::alloc::alloc(layout) };
             let mut total = 0u64;
             loop {
-                let n = unsafe {
-                    libc::read(file.as_raw_fd(), buffer as *mut libc::c_void, 4 << 20)
-                };
+                let n =
+                    unsafe { libc::read(file.as_raw_fd(), buffer as *mut libc::c_void, 4 << 20) };
                 if n <= 0 {
                     break;
                 }
@@ -139,7 +141,12 @@ fn mount_of(point: &str) -> String {
         .unwrap_or_default()
         .lines()
         .find(|line| line.split_whitespace().nth(1) == Some(point))
-        .map(|line| line.split_whitespace().take(4).collect::<Vec<_>>().join(" "))
+        .map(|line| {
+            line.split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .unwrap_or_else(|| "?".into())
 }
 
