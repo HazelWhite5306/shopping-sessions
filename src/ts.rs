@@ -157,7 +157,19 @@ pub fn parse(s: &[u8]) -> Option<i64> {
     if n == 0 {
         return None;
     }
-    if s[0].is_ascii_digit() {
+    if n <= 18 && s[0].is_ascii_digit() {
+        // F3 that cannot overflow: up to 18 digits is under 10^18.
+        let mut value: i64 = 0;
+        let mut all_digits = true;
+        for &b in s {
+            let digit = b.wrapping_sub(b'0');
+            all_digits &= digit < 10;
+            value = value.wrapping_mul(10).wrapping_add(i64::from(digit));
+        }
+        if all_digits {
+            return Some(value);
+        }
+    } else if s[0].is_ascii_digit() {
         // F3 if every byte is a digit.
         let mut value: i64 = 0;
         let mut all_digits = true;
