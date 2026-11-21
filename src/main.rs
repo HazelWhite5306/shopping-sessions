@@ -67,6 +67,17 @@ fn main() {
         .num_threads(threads)
         .build_global()
         .ok();
+    if std::env::var("SESSIONS_EXPERIMENT").as_deref() == Ok("sizes") {
+        eprintln!(
+            "EventCopy {} LiveEvent {} ValidClick {} PersonEvent {} PersonClick {}",
+            std::mem::size_of::<EventCopy>(),
+            std::mem::size_of::<LiveEvent>(),
+            std::mem::size_of::<ValidClick>(),
+            std::mem::size_of::<PersonEvent>(),
+            std::mem::size_of::<PersonClick>()
+        );
+        return;
+    }
     run(&data, &output, start);
     log(start, "done");
     // Every output file is closed; skip freeing memory and unmapping files.
@@ -343,27 +354,32 @@ impl<'a> Lookup<'a> {
 
 // ---------------------------------------------------------------- rows
 
-/// One parsed copy of an event, before dedup (40 bytes).
+/// Price (low 24 bits; at most 10,000,000) and category (high 8 bits).
+/// Category 255 marks an invalid event copy.
+const INVALID: u32 = 0xFF << 24;
+
+#[inline]
+fn pack(price: u32, category: u16) -> u32 {
+    price | u32::from(category) << 24
+}
+
+/// One parsed copy of an event, before dedup (40 bytes). `ts` is
+/// milliseconds after the window start, which a 14-day window fits easily.
 #[derive(Clone, Copy)]
 struct EventCopy {
     event_id: Key,
-    user_id: Key,
-    ts: i64,
+    user_id: Text,
     ingest: i64,
-    /// Price for a valid purchase, 0 for view and cart.
-    price: u32,
-    category: u16,
-    valid: bool,
+    ts: u32,
+    price_category: u32,
 }
 
-/// A kept, valid event, before its user ID is interned.
+/// A kept, valid event, before its user ID is interned (24 bytes).
 #[derive(Clone, Copy)]
 struct LiveEvent {
     user_id: Key,
-    user_hash: u64,
-    ts: i64,
-    price: u32,
-    category: u16,
+    ts: u32,
+    price_category: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -379,9 +395,21 @@ struct ValidClick {
 #[derive(Clone, Copy)]
 struct PersonEvent {
     person: u32,
-    price: u32,
-    ts: i64,
-    category: u16,
+    /// Milliseconds after the window start.
+    ts: u32,
+    price_category: u32,
+}
+
+impl PersonEvent {
+    #[inline]
+    fn price(&self) -> u32 {
+        self.price_category & 0xFF_FFFF
+    }
+
+    #[inline]
+    fn category(&self) -> u16 {
+        (self.price_category >> 24) as u16
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -428,7 +456,7 @@ fn parse_event(fields: [&[u8]; 7], context: &Context, clock: &mut ts::Parser) ->
     let ingest = clock.parse(ingest_field);
     let mut valid = !user_id.is_empty() && !product.is_empty() && ingest.is_some();
     let ingest = ingest.unwrap_or(i64::MAX);
-    let mut price_cents = 0;
+    let mut price_cents: u32 = 0;
     match kind {
         b"view" | b"cart" => {}
         b"purchase" => match parse_price(price) {
@@ -437,7 +465,7 @@ fn parse_event(fields: [&[u8]; 7], context: &Context, clock: &mut ts::Parser) ->
         },
         _ => valid = false,
     }
-    let mut ts = 0;
+    let mut ts = context.window_start;
     if valid {
         match clock.parse(ts_field) {
             Some(t) if t >= context.window_start && t < context.window_end => ts = t,
@@ -447,22 +475,23 @@ fn parse_event(fields: [&[u8]; 7], context: &Context, clock: &mut ts::Parser) ->
     if valid && ingest - ts > LATE {
         valid = false;
     }
-    let category = if valid {
-        context
-            .products
-            .get(product)
-            .unwrap_or(context.unknown_category)
+    let price_category = if valid {
+        pack(
+            price_cents,
+            context
+                .products
+                .get(product)
+                .unwrap_or(context.unknown_category),
+        )
     } else {
-        0
+        INVALID
     };
     Some(EventCopy {
         event_id: Key::new(event_id),
-        user_id: Key::new(user_id),
-        ts,
+        user_id: Text::new(user_id),
         ingest,
-        price: price_cents,
-        category,
-        valid,
+        ts: (ts - context.window_start) as u32,
+        price_category,
     })
 }
 
@@ -573,6 +602,16 @@ fn run(data: &Path, output: &Path, start: Instant) {
     }
     let unknown_category = category_names.len() as u16;
     category_names.push(b"unknown");
+    // Rows pack the category into 8 bits (255 marks an invalid copy) and the
+    // event time into 32 bits after the window start.
+    assert!(
+        category_names.len() <= 255,
+        "more than 254 categories in products.csv"
+    );
+    assert!(
+        window_end - window_start <= i64::from(u32::MAX),
+        "the event window is longer than 49 days"
+    );
     // Ranks in byte order, so a tie in top_category goes to the smaller rank.
     let mut order: Vec<usize> = (0..category_names.len()).collect();
     order.sort_by_key(|&at| category_names[at]);
@@ -627,7 +666,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
                 let mut clock = ts::Parser::new();
                 csv::for_records::<7>(chunk, |fields| {
                     if let Some(event) = parse_event(fields, &context, &mut clock) {
-                        n += usize::from(event.valid) + (event.event_id.hash() as usize & 1);
+                        n += usize::from(event.price_category != INVALID) + (event.event_id.hash() as usize & 1);
                     }
                 });
                 n
@@ -739,14 +778,12 @@ fn run(data: &Path, output: &Path, start: Instant) {
             }
             let mut out: Vec<Vec<LiveEvent>> = shard_vecs(SHARDS, total / SHARDS + 16);
             for kept in table.iter() {
-                if kept.valid {
-                    let user_hash = kept.user_id.hash();
-                    out[shard(user_hash)].push(LiveEvent {
-                        user_id: kept.user_id,
-                        user_hash,
+                if kept.price_category != INVALID {
+                    let user_id = Key::new(kept.user_id.get());
+                    out[shard(user_id.hash())].push(LiveEvent {
+                        user_id,
                         ts: kept.ts,
-                        price: kept.price,
-                        category: kept.category,
+                        price_category: kept.price_category,
                     });
                 }
             }
@@ -784,10 +821,9 @@ fn run(data: &Path, output: &Path, start: Instant) {
             for part in &live {
                 for event in &part[at] {
                     events.push(PersonEvent {
-                        person: ids.intern(event.user_id, event.user_hash),
-                        price: event.price,
+                        person: ids.intern(event.user_id, event.user_id.hash()),
                         ts: event.ts,
-                        category: event.category,
+                        price_category: event.price_category,
                     });
                 }
             }
@@ -973,6 +1009,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
                     days,
                     organic,
                     &category_rank,
+                    window_start,
                 );
             }
             tally
@@ -1065,6 +1102,7 @@ fn sessionize(
     days: usize,
     organic: usize,
     category_rank: &[u16],
+    window_start: i64,
 ) {
     let mut sums = std::mem::take(&mut tally.sums);
     let mut click_at = 0;
@@ -1090,10 +1128,11 @@ fn sessionize(
         sums.clear();
         let mut s = at;
         while s < end {
-            let session_start = events[s].ts;
+            let first = events[s].ts;
+            let session_start = window_start + i64::from(first);
             let mut e = s + 1;
-            let mut previous = session_start;
-            while e < end && events[e].ts - previous <= SESSION_GAP {
+            let mut previous = first;
+            while e < end && i64::from(events[e].ts - previous) <= SESSION_GAP {
                 previous = events[e].ts;
                 e += 1;
             }
@@ -1106,12 +1145,12 @@ fn sessionize(
             }
             let mut revenue: u64 = 0;
             for event in &events[s..e] {
-                if event.price > 0 {
-                    let price = u64::from(event.price);
+                if event.price() > 0 {
+                    let price = u64::from(event.price());
                     revenue += price;
-                    match sums.iter_mut().find(|(c, _)| *c == event.category) {
+                    match sums.iter_mut().find(|(c, _)| *c == event.category()) {
                         Some(entry) => entry.1 += price,
-                        None => sums.push((event.category, price)),
+                        None => sums.push((event.category(), price)),
                     }
                 }
             }
