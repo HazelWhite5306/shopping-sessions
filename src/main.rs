@@ -9,6 +9,7 @@
 //! files, and shards are read in place, so memory stays small.
 
 mod csv;
+mod diag;
 mod key;
 mod out;
 mod ts;
@@ -78,8 +79,15 @@ fn main() {
         );
         return;
     }
+    let diagnose = std::env::var("SESSIONS_DIAG").as_deref() == Ok("1");
+    if diagnose {
+        diag::before(&data, start);
+    }
     run(&data, &output, start);
     log(start, "done");
+    if diagnose {
+        diag::after(&data, &output, run);
+    }
     // Every output file is closed; skip freeing memory and unmapping files.
     std::process::exit(0);
 }
