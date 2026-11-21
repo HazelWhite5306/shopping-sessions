@@ -723,7 +723,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
                 .par_iter()
                 .map(|chunk| {
                     let mut shards: Vec<Vec<EventCopy>> =
-                        shard_vecs(SHARDS, chunk.len() / 70 / SHARDS + 16);
+                        shard_vecs(SHARDS, chunk.len() / 70 / SHARDS * 5 / 4 + 64);
                     populate(chunk);
                     let mut clock = ts::Parser::new();
                     csv::for_records::<7>(chunk, |fields| {
@@ -742,7 +742,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
                         .par_iter()
                         .map(|chunk| {
                             let mut shards: Vec<Vec<ValidClick>> =
-                                shard_vecs(SHARDS, chunk.len() / 45 / SHARDS + 16);
+                                shard_vecs(SHARDS, chunk.len() / 45 / SHARDS * 5 / 4 + 64);
                             populate(chunk);
                             let mut clock = ts::Parser::new();
                             csv::for_records::<4>(chunk, |fields| {
@@ -827,7 +827,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
         .enumerate()
         .map(|(at, total)| {
             let part = |chunk: usize| unsafe { &mut (&mut *rows.0.add(chunk))[at] };
-            let mut out: Vec<Vec<LiveEvent>> = shard_vecs(SHARDS, total / SHARDS + 16);
+            let mut out: Vec<Vec<LiveEvent>> = shard_vecs(SHARDS, total / SHARDS * 5 / 4 + 64);
             for chunk in 0..chunk_count {
                 for kept in part(chunk).iter() {
                     if kept.price_category != INVALID {
@@ -958,14 +958,14 @@ fn run(data: &Path, output: &Path, start: Instant) {
         .zip(base.par_iter())
         .map(|(user_shard, &offset)| {
             let mut events: Vec<Vec<PersonEvent>> =
-                shard_vecs(BUCKETS, user_shard.events.len() / BUCKETS * 5 / 4 + 8);
+                shard_vecs(BUCKETS, user_shard.events.len() / BUCKETS * 3 / 2 + 32);
             for mut event in std::mem::take(&mut user_shard.events) {
                 let code = person[(offset + event.person) as usize];
                 event.person = code & 0xFF_FFFF;
                 events[(code >> 24) as usize].push(event);
             }
             let mut clicks: Vec<Vec<PersonClick>> =
-                shard_vecs(BUCKETS, user_shard.clicks.len() / BUCKETS * 5 / 4 + 8);
+                shard_vecs(BUCKETS, user_shard.clicks.len() / BUCKETS * 3 / 2 + 32);
             for mut click in std::mem::take(&mut user_shard.clicks) {
                 let code = person[(offset + click.person) as usize];
                 click.person = code & 0xFF_FFFF;
