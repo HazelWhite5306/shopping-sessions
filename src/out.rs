@@ -45,9 +45,9 @@ fn properties() -> Arc<WriterProperties> {
 
 type Writer = SerializedFileWriter<BufWriter<File>>;
 
-fn open(dir: &Path, schema: &str) -> Writer {
+fn open(dir: &Path, part: usize, schema: &str) -> Writer {
     fs::create_dir_all(dir).expect("create output folder");
-    let file = File::create(dir.join("part-0.parquet")).expect("create parquet file");
+    let file = File::create(dir.join(format!("part-{part}.parquet"))).expect("create parquet file");
     let schema = Arc::new(parse_message_type(schema).expect("schema"));
     SerializedFileWriter::new(BufWriter::with_capacity(1 << 22, file), schema, properties())
         .expect("parquet writer")
@@ -68,9 +68,10 @@ macro_rules! column {
     }};
 }
 
-pub fn write_users(dir: &Path, rows: &[UserRow]) {
+pub fn write_users(dir: &Path, part: usize, rows: &[UserRow]) {
     let mut writer = open(
         dir,
+        part,
         "message user_daily {
             REQUIRED BYTE_ARRAY user_id (UTF8);
             REQUIRED INT32 day (DATE);
@@ -104,6 +105,7 @@ pub fn write_users(dir: &Path, rows: &[UserRow]) {
 pub fn write_campaigns(dir: &Path, rows: &[CampaignRow]) {
     let mut writer = open(
         dir,
+        0,
         "message campaign_daily {
             REQUIRED BYTE_ARRAY campaign_id (UTF8);
             REQUIRED BYTE_ARRAY channel (UTF8);

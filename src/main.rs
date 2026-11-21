@@ -11,6 +11,7 @@
 mod csv;
 mod key;
 mod out;
+mod sort;
 mod ts;
 
 use std::fs::{self, File};
@@ -812,6 +813,10 @@ fn run(data: &Path, output: &Path, start: Instant) {
         stamp: vec![u64::MAX; campaign_slots],
         session: 0,
     };
+    let person_bits = sort::bits(count as u64);
+    let event_ts_bits = sort::bits((window_end - window_start).max(0) as u64);
+    let click_start = window_start - WEEK;
+    let click_ts_bits = sort::bits((window_end - click_start).max(0) as u64);
     let tally = (0..BUCKETS)
         .into_par_iter()
         .fold(empty_tally, |mut tally, at| {
@@ -825,12 +830,40 @@ fn run(data: &Path, output: &Path, start: Instant) {
             for (_, part) in &regrouped {
                 clicks.extend_from_slice(&part[at]);
             }
-            events.sort_unstable_by_key(|e| (e.person, e.ts));
-            clicks.sort_unstable_by(|a, b| {
-                (a.person, a.ts)
-                    .cmp(&(b.person, b.ts))
-                    .then_with(|| a.click_id.cmp(&b.click_id))
-            });
+            // Radix sort on (person, ts) packed into 64 bits when they fit.
+            if person_bits + event_ts_bits <= 64 {
+                sort::radix_sort(&mut events, person_bits + event_ts_bits, |e| {
+                    u64::from(e.person) << event_ts_bits | (e.ts - window_start) as u64
+                });
+            } else {
+                events.sort_unstable_by_key(|e| (e.person, e.ts));
+            }
+            if person_bits + click_ts_bits <= 64 {
+                sort::radix_sort(&mut clicks, person_bits + click_ts_bits, |c| {
+                    u64::from(c.person) << click_ts_bits | (c.ts - click_start) as u64
+                });
+                // Equal (person, ts) runs are rare; order them by click_id.
+                let mut at = 0;
+                while at < clicks.len() {
+                    let mut end = at + 1;
+                    while end < clicks.len()
+                        && clicks[end].person == clicks[at].person
+                        && clicks[end].ts == clicks[at].ts
+                    {
+                        end += 1;
+                    }
+                    if end - at > 1 {
+                        clicks[at..end].sort_unstable_by(|a, b| a.click_id.cmp(&b.click_id));
+                    }
+                    at = end;
+                }
+            } else {
+                clicks.sort_unstable_by(|a, b| {
+                    (a.person, a.ts)
+                        .cmp(&(b.person, b.ts))
+                        .then_with(|| a.click_id.cmp(&b.click_id))
+                });
+            }
             sessionize(
                 &events,
                 &clicks,
@@ -892,8 +925,20 @@ fn run(data: &Path, output: &Path, start: Instant) {
             });
         }
     }
+    // Any number of Parquet files is fine, so the user table is written as
+    // several files in parallel.
+    let user_dir = output.join("user_daily");
+    let per_file = user_rows.len().div_ceil(8).max(1);
     rayon::join(
-        || out::write_users(&output.join("user_daily"), &user_rows),
+        || {
+            user_rows
+                .par_chunks(per_file)
+                .enumerate()
+                .for_each(|(part, rows)| out::write_users(&user_dir, part, rows));
+            if user_rows.is_empty() {
+                out::write_users(&user_dir, 0, &[]);
+            }
+        },
         || out::write_campaigns(&output.join("campaign_daily"), &campaign_rows),
     );
     log(
