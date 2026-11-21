@@ -363,12 +363,12 @@ fn pack(price: u32, category: u16) -> u32 {
     price | u32::from(category) << 24
 }
 
-/// One parsed copy of an event, before dedup (40 bytes). `ts` is
+/// One parsed copy of an event, before dedup (48 bytes). `ts` is
 /// milliseconds after the window start, which a 14-day window fits easily.
 #[derive(Clone, Copy)]
 struct EventCopy {
     event_id: Key,
-    user_id: Text,
+    user_id: Key,
     ingest: i64,
     ts: u32,
     price_category: u32,
@@ -487,7 +487,7 @@ fn parse_event(fields: [&[u8]; 7], context: &Context, clock: &mut ts::Parser) ->
     };
     Some(EventCopy {
         event_id: Key::new(event_id),
-        user_id: Text::new(user_id),
+        user_id: Key::new(user_id),
         ingest,
         ts: (ts - context.window_start) as u32,
         price_category,
@@ -750,7 +750,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
     let chunk_count = events.len();
     let rows = Rows(events.as_mut_ptr());
     let rows = &rows;
-    let live: Vec<Vec<Vec<LiveEvent>>> = (0..SHARDS)
+    let live: Vec<usize> = (0..SHARDS)
         .into_par_iter()
         .map(|at| {
             // Every chunk's part `at` belongs to this thread alone.
@@ -783,11 +783,20 @@ fn run(data: &Path, output: &Path, start: Instant) {
                 }
             }
             drop(table);
+            total
+        })
+        .collect::<Vec<usize>>();
+    log(start, "dedup tables");
+    let live: Vec<Vec<Vec<LiveEvent>>> = live
+        .into_par_iter()
+        .enumerate()
+        .map(|(at, total)| {
+            let part = |chunk: usize| unsafe { &mut (&mut *rows.0.add(chunk))[at] };
             let mut out: Vec<Vec<LiveEvent>> = shard_vecs(SHARDS, total / SHARDS + 16);
             for chunk in 0..chunk_count {
                 for kept in part(chunk).iter() {
                     if kept.price_category != INVALID {
-                        let user_id = Key::new(kept.user_id.get());
+                        let user_id = kept.user_id;
                         out[shard(user_id.hash())].push(LiveEvent {
                             user_id,
                             ts: kept.ts,
