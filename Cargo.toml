@@ -1,0 +1,20 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+memchr = "2.8"
+memmap2 = "0.9"
+mimalloc = { version = "0.1", default-features = false }
+parquet = { version = "60", default-features = false }
+rayon = "1.12"
+rustc-hash = "2.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
