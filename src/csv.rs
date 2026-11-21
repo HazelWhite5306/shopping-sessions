@@ -60,6 +60,7 @@ pub fn split<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 }
 
 /// Bits for every `\n`, `,` and `"` in the 64 bytes at `at` (fewer at the end).
+#[cfg(test)]
 #[inline(always)]
 fn structural(data: &[u8], at: usize) -> u64 {
     if at + 64 <= data.len() {
@@ -96,9 +97,10 @@ fn structural(data: &[u8], at: usize) -> u64 {
 /// starts at a line start, and skips malformed lines. Matches
 /// `for_lines` + `split::<N>` exactly, but finds every separator and quote
 /// 64 bytes at a time.
+#[cfg(test)]
 #[inline]
 #[allow(unused_assignments)]
-pub fn for_records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+pub fn for_records_branchy<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     let n = data.len();
     let mut fields: [&'a [u8]; N] = [&data[..0]; N];
     let mut line_start = 0;
@@ -167,6 +169,112 @@ pub fn for_records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u
     }
 }
 
+/// Masks of the commas, newlines and quotes in the 64 bytes at `at`
+/// (fewer at the end of `data`).
+#[inline(always)]
+fn masks3(data: &[u8], at: usize) -> (u64, u64, u64) {
+    if at + 64 <= data.len() {
+        #[cfg(target_feature = "avx2")]
+        unsafe {
+            use std::arch::x86_64::*;
+            let pointer = data.as_ptr().add(at);
+            let a = _mm256_loadu_si256(pointer as *const __m256i);
+            let b = _mm256_loadu_si256(pointer.add(32) as *const __m256i);
+            let mask = |v: __m256i, c: u8| {
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64
+            };
+            return (
+                mask(a, b',') | mask(b, b',') << 32,
+                mask(a, b'\n') | mask(b, b'\n') << 32,
+                mask(a, b'"') | mask(b, b'"') << 32,
+            );
+        }
+    }
+    let (mut commas, mut newlines, mut quotes) = (0u64, 0u64, 0u64);
+    for (i, &byte) in data[at..data.len().min(at + 64)].iter().enumerate() {
+        match byte {
+            b',' => commas |= 1 << i,
+            b'\n' => newlines |= 1 << i,
+            b'"' => quotes |= 1 << i,
+            _ => {}
+        }
+    }
+    (commas, newlines, quotes)
+}
+
+/// Calls `f` with the `N` fields of every well-formed line in a chunk that
+/// starts at a line start, and skips malformed lines. Matches
+/// `for_lines` + `split::<N>` exactly.
+///
+/// Only commas and newlines are visited one by one. A line is well formed
+/// when it has exactly N - 1 commas and its quote count equals twice the
+/// number of fields that are at least 2 bytes long and start and end with a
+/// quote: then every quote is one of those fields' wrapping quotes.
+#[inline]
+pub fn for_records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+    let n = data.len();
+    // Comma positions of the current line; one spare slot detects too many.
+    let mut commas = [0usize; N];
+    let mut count = 0usize;
+    let mut line_start = 0usize;
+    // Quotes before the current block, and before the current line.
+    let mut quotes_before_block = 0u32;
+    let mut quotes_at_line_start = 0u32;
+
+    let mut handle = |line_start: usize, end: usize, commas: &[usize; N], count: usize, quotes: u32| {
+        // An empty line is malformed whatever N is.
+        if count != N - 1 || end == line_start {
+            return;
+        }
+        let mut fields: [&'a [u8]; N] = [&data[..0]; N];
+        let mut wrapped = 0u32;
+        let mut start = line_start;
+        for at in 0..N {
+            let stop = if at + 1 < N { commas[at] } else { end };
+            let field = &data[start..stop];
+            if field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' {
+                wrapped += 1;
+                fields[at] = &field[1..field.len() - 1];
+            } else {
+                fields[at] = field;
+            }
+            start = stop + 1;
+        }
+        if quotes == 2 * wrapped {
+            f(fields);
+        }
+    };
+
+    let mut base = 0;
+    while base < n {
+        let (comma_bits, newline_bits, quote_bits) = masks3(data, base);
+        let mut separators = comma_bits | newline_bits;
+        while separators != 0 {
+            let bit = separators.trailing_zeros();
+            separators &= separators - 1;
+            let at = base + bit as usize;
+            if newline_bits >> bit & 1 == 0 {
+                if count < N {
+                    commas[count] = at;
+                }
+                count += 1;
+            } else {
+                let below = if bit == 0 { 0 } else { quote_bits & (u64::MAX >> (64 - bit)) };
+                let quotes_here = quotes_before_block + below.count_ones();
+                handle(line_start, at, &commas, count, quotes_here - quotes_at_line_start);
+                quotes_at_line_start = quotes_here;
+                count = 0;
+                line_start = at + 1;
+            }
+        }
+        quotes_before_block += quote_bits.count_ones();
+        base += 64;
+    }
+    if line_start < n {
+        handle(line_start, n, &commas, count, quotes_before_block - quotes_at_line_start);
+    }
+}
+
 /// Calls `f` on every line of a chunk that starts at a line start.
 #[inline]
 pub fn for_lines<'a>(data: &'a [u8], mut f: impl FnMut(&'a [u8])) {
@@ -190,6 +298,14 @@ mod tests {
             if let Some(fields) = split::<N>(line) {
                 out.push(fields.iter().map(|f| f.to_vec()).collect());
             }
+        });
+        out
+    }
+
+    fn branchy<const N: usize>(data: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        for_records_branchy::<N>(data, |fields| {
+            out.push(fields.iter().map(|f| f.to_vec()).collect());
         });
         out
     }
@@ -244,6 +360,8 @@ mod tests {
             assert_eq!(fast::<2>(&data), reference::<2>(&data), "{:?}", String::from_utf8_lossy(&data));
             assert_eq!(fast::<4>(&data), reference::<4>(&data), "{:?}", String::from_utf8_lossy(&data));
             assert_eq!(fast::<7>(&data), reference::<7>(&data), "{:?}", String::from_utf8_lossy(&data));
+            assert_eq!(branchy::<4>(&data), reference::<4>(&data), "{:?}", String::from_utf8_lossy(&data));
+            assert_eq!(fast::<1>(&data), reference::<1>(&data), "{:?}", String::from_utf8_lossy(&data));
         }
     }
 
