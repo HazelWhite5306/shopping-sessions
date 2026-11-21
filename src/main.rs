@@ -46,8 +46,18 @@ fn log(start: Instant, what: &str) {
     eprintln!("[{:>7.3}s] {what}", start.elapsed().as_secs_f64());
 }
 
+/// mimalloc options, by their index in mimalloc.h's `mi_option_e`.
+const MI_OPTION_ALLOW_LARGE_OS_PAGES: libmimalloc_sys::mi_option_t = 6;
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
 fn main() {
     let start = Instant::now();
+    // Never hand freed memory back to the OS mid-run: re-faulting it cost as
+    // much kernel time as the pipeline's own work. Large pages cut the rest.
+    unsafe {
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, -1);
+        libmimalloc_sys::mi_option_set(MI_OPTION_ALLOW_LARGE_OS_PAGES, 1);
+    }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads = std::env::var("NCPU")
