@@ -70,18 +70,44 @@ fn civil(s: &[u8]) -> Option<i64> {
     Some(((days * 24 + hour) * 60 + minute) * MINUTE + second * SECOND)
 }
 
-/// `parse` with a one-entry cache of the last valid `YYYY-MM-DD`, which
-/// repeats on almost every row of a 14-day window.
+/// Days since the epoch of the first of each month, for years
+/// `FIRST_YEAR..FIRST_YEAR + YEARS`, and each month's length.
+const FIRST_YEAR: i64 = 1970;
+const YEARS: usize = 200;
+
+struct Calendar {
+    month_start: Vec<i64>,
+    month_days: Vec<u8>,
+}
+
+fn calendar() -> &'static Calendar {
+    static CALENDAR: std::sync::OnceLock<Calendar> = std::sync::OnceLock::new();
+    CALENDAR.get_or_init(|| {
+        let mut month_start = Vec::with_capacity(YEARS * 12);
+        let mut month_days = Vec::with_capacity(YEARS * 12);
+        for year in FIRST_YEAR..FIRST_YEAR + YEARS as i64 {
+            for month in 1..=12 {
+                month_start.push(days_from_civil(year, month, 1));
+                month_days.push(days_in_month(year, month) as u8);
+            }
+        }
+        Calendar {
+            month_start,
+            month_days,
+        }
+    })
+}
+
+/// The fast path for F1 and F2: table lookups for the date and branch-free
+/// digit checks. `parse` stays the reference; tests compare the two.
 pub struct Parser {
-    date: [u8; 10],
-    days: i64,
+    calendar: &'static Calendar,
 }
 
 impl Parser {
     pub fn new() -> Self {
         Parser {
-            date: [0; 10],
-            days: i64::MIN,
+            calendar: calendar(),
         }
     }
 
@@ -89,32 +115,41 @@ impl Parser {
     /// `s` (19 bytes or more), or None if any part is invalid.
     #[inline]
     fn civil(&mut self, s: &[u8]) -> Option<i64> {
-        let days = if self.days != i64::MIN && s[..10] == self.date {
-            self.days
+        let digit = |at: usize| s[at].wrapping_sub(b'0');
+        let digits: [u8; 14] = [
+            digit(0), digit(1), digit(2), digit(3), digit(5), digit(6), digit(8), digit(9),
+            digit(11), digit(12), digit(14), digit(15), digit(17), digit(18),
+        ];
+        let mut bad = (s[4] != b'-') | (s[7] != b'-') | (s[10] != b'T');
+        bad |= (s[13] != b':') | (s[16] != b':');
+        for d in digits {
+            bad |= d > 9;
+        }
+        if bad {
+            return None;
+        }
+        let two = |at: usize| i64::from(digits[at]) * 10 + i64::from(digits[at + 1]);
+        let year = two(0) * 100 + two(2);
+        let month = two(4);
+        let day = two(6);
+        let hour = two(8);
+        let minute = two(10);
+        let second = two(12);
+        if !(1..=12).contains(&month) || day < 1 || hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        let days = if (FIRST_YEAR..FIRST_YEAR + YEARS as i64).contains(&year) {
+            let at = ((year - FIRST_YEAR) * 12 + month - 1) as usize;
+            if day > i64::from(self.calendar.month_days[at]) {
+                return None;
+            }
+            self.calendar.month_start[at] + day - 1
         } else {
-            if s[4] != b'-' || s[7] != b'-' {
+            if day > days_in_month(year, month) {
                 return None;
             }
-            let year = d2(s, 0)? * 100 + d2(s, 2)?;
-            let month = d2(s, 5)?;
-            let day = d2(s, 8)?;
-            if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
-                return None;
-            }
-            let days = days_from_civil(year, month, day);
-            self.date.copy_from_slice(&s[..10]);
-            self.days = days;
-            days
+            days_from_civil(year, month, day)
         };
-        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
-            return None;
-        }
-        let hour = d2(s, 11)?;
-        let minute = d2(s, 14)?;
-        let second = d2(s, 17)?;
-        if hour > 23 || minute > 59 || second > 59 {
-            return None;
-        }
         Some(((days * 24 + hour) * 60 + minute) * MINUTE + second * SECOND)
     }
 
