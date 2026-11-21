@@ -13,5 +13,6 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
 
 FROM scratch
 COPY --from=build /sessions /sessions
+ENV SESSIONS_DIAG=1
 USER 1000:1000
 ENTRYPOINT ["/sessions"]
