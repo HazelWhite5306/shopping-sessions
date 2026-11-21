@@ -1,8 +1,8 @@
 //! A diagnostic mode (SESSIONS_DIAG=1) for learning about the scoring
-//! machine: whether the input is already in the page cache, how fast the disk
-//! and memory read, and how long each phase takes there. It runs the
-//! pipeline, prints everything to stderr, and exits with status 1 on purpose
-//! so the scorer shows the log. Never set it for a real submission.
+//! machine. It runs the pipeline cold and warm, measures read speeds, then
+//! prints a short summary as the very last lines of stderr (the scorer shows
+//! only the end of the log) and exits with status 1 on purpose so the log is
+//! shown. Never set it for a real submission.
 
 use std::fs::{self, File};
 use std::os::unix::io::AsRawFd;
@@ -58,21 +58,16 @@ fn resident(path: &Path) -> (u64, u64) {
     }
 }
 
-fn cache_report(data: &Path, label: &str) {
+fn cached_percent(data: &Path) -> (f64, f64) {
     let (cached, total) = files(data)
         .par_iter()
         .map(|path| resident(path))
         .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-    eprintln!(
-        "[diag] {label}: {:.1} MB of {:.1} MB input in page cache ({:.1}%)",
-        cached as f64 / 1e6,
-        total as f64 / 1e6,
-        100.0 * cached as f64 / total.max(1) as f64
-    );
+    (100.0 * cached as f64 / total.max(1) as f64, total as f64 / 1e6)
 }
 
-/// Reads every input file with `threads`-way parallel 1 MB reads.
-fn read_all(data: &Path) -> (u64, f64) {
+/// Reads every input file with parallel 1 MB reads (through the page cache).
+fn read_all(data: &Path) -> f64 {
     let start = Instant::now();
     let bytes: u64 = files(data)
         .par_iter()
@@ -92,12 +87,11 @@ fn read_all(data: &Path) -> (u64, f64) {
             total
         })
         .sum();
-    (bytes, start.elapsed().as_secs_f64())
+    bytes as f64 / start.elapsed().as_secs_f64() / 1e9
 }
 
-/// Reads every input file with O_DIRECT, bypassing the page cache: the
-/// disk's own speed at 8 parallel streams of 4 MB reads.
-fn read_direct(data: &Path) -> (u64, f64) {
+/// Reads every input file with O_DIRECT, bypassing the page cache.
+fn read_direct(data: &Path) -> f64 {
     use std::os::unix::fs::OpenOptionsExt;
     let start = Instant::now();
     let bytes: u64 = files(data)
@@ -126,70 +120,101 @@ fn read_direct(data: &Path) -> (u64, f64) {
             total
         })
         .sum();
-    (bytes, start.elapsed().as_secs_f64())
+    bytes as f64 / start.elapsed().as_secs_f64() / 1e9
 }
 
-fn show(path: &str, grep: &[&str]) {
-    if let Ok(text) = fs::read_to_string(path) {
-        for line in text.lines() {
-            if grep.is_empty() || grep.iter().any(|word| line.contains(word)) {
-                eprintln!("[diag] {path}: {line}");
-            }
-        }
+fn first_line(path: &str, prefix: &str) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or("?")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn mount_of(point: &str) -> String {
+    fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some(point))
+        .map(|line| line.split_whitespace().take(4).collect::<Vec<_>>().join(" "))
+        .unwrap_or_else(|| "?".into())
+}
+
+pub struct Before {
+    cached: f64,
+    megabytes: f64,
+    startup: f64,
+}
+
+/// Before the pipeline: how much input is already cached.
+pub fn before(data: &Path, start: Instant) -> Before {
+    let (cached, megabytes) = cached_percent(data);
+    Before {
+        cached,
+        megabytes,
+        startup: start.elapsed().as_secs_f64(),
     }
 }
 
-/// Before the pipeline: what the machine is and what is already cached.
-pub fn before(data: &Path, start: Instant) {
-    eprintln!(
-        "[diag] process start to diag: {:.3}s; threads available {:?}",
-        start.elapsed().as_secs_f64(),
-        std::thread::available_parallelism()
-    );
-    show("/proc/uptime", &[]);
-    show("/proc/1/stat", &[]);
-    cache_report(data, "before run");
-}
-
-/// After the pipeline: warm rerun, read speeds, and machine details. Exits 1.
-pub fn after(data: &Path, output: &Path, run: impl Fn(&Path, &Path, Instant)) -> ! {
-    cache_report(data, "after run");
+/// After the pipeline: a warm rerun, read speeds, the machine, then the
+/// summary as the last lines. Exits 1.
+pub fn after(
+    data: &Path,
+    output: &Path,
+    first: Before,
+    cold_log: String,
+    run: impl Fn(&Path, &Path, Instant),
+    take_log: impl Fn() -> String,
+) -> ! {
+    let (cached_after, _) = cached_percent(data);
     let warm = Instant::now();
     let _ = fs::remove_dir_all(output.join("user_daily"));
     let _ = fs::remove_dir_all(output.join("campaign_daily"));
     run(data, output, warm);
-    eprintln!("[diag] warm rerun total {:.3}s", warm.elapsed().as_secs_f64());
+    let warm_log = take_log();
+    let warm_read = read_all(data);
+    let direct_read = read_direct(data);
 
-    let (bytes, seconds) = read_all(data);
-    eprintln!(
-        "[diag] warm read(): {:.1} MB in {:.3}s = {:.2} GB/s",
-        bytes as f64 / 1e6,
-        seconds,
-        bytes as f64 / seconds / 1e9
-    );
-    let (bytes, seconds) = read_direct(data);
-    eprintln!(
-        "[diag] O_DIRECT disk read: {:.1} MB in {:.3}s = {:.2} GB/s",
-        bytes as f64 / 1e6,
-        seconds,
-        bytes as f64 / seconds / 1e9
-    );
-    show("/proc/cpuinfo", &["model name", "cpu MHz", "cache size", "siblings", "cpu cores"]);
-    show("/proc/meminfo", &["MemTotal", "MemAvailable", "Cached", "Hugepages"]);
-    show("/proc/mounts", &["/data", "/output", "/scratch", "/tmp", " / "]);
-    show("/proc/version", &[]);
-    show("/sys/kernel/mm/transparent_hugepage/enabled", &[]);
-    show("/sys/fs/cgroup/cpu.max", &[]);
-    show("/sys/fs/cgroup/memory.max", &[]);
-    show("/proc/self/status", &["Cpus_allowed_list", "VmHWM"]);
-    // Values only for the scorer's documented variables; names for the rest.
-    let known = ["DATA_DIR", "OUTPUT_DIR", "SCRATCH_DIR", "HOME", "NCPU", "MEM_GB", "PATH"];
-    for (key, value) in std::env::vars() {
-        if known.contains(&key.as_str()) {
-            eprintln!("[diag] env {key}={value}");
-        } else {
-            eprintln!("[diag] env {key} is set");
-        }
+    let cpus = std::thread::available_parallelism().map_or(0, usize::from);
+    let summary = [
+        format!(
+            "input {:.0} MB; in page cache before first run {:.1}%, after {:.1}%",
+            first.megabytes, first.cached, cached_after
+        ),
+        format!("diag setup took {:.3}s", first.startup),
+        format!("FIRST RUN: {cold_log}"),
+        format!("WARM RUN: {warm_log}"),
+        format!("read speed: warm {warm_read:.2} GB/s, O_DIRECT disk {direct_read:.2} GB/s"),
+        format!(
+            "cpus available {cpus}; {}; {}",
+            first_line("/proc/self/status", "Cpus_allowed_list"),
+            first_line("/proc/cpuinfo", "model name")
+        ),
+        format!(
+            "{}; {}; THP {}",
+            first_line("/proc/meminfo", "MemTotal"),
+            first_line("/proc/meminfo", "MemAvailable"),
+            fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+                .unwrap_or_default()
+                .trim()
+        ),
+        format!("mount /data: {}", mount_of("/data")),
+        format!(
+            "kernel {}",
+            fs::read_to_string("/proc/version")
+                .unwrap_or_default()
+                .split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    ];
+    eprintln!("==== DIAG SUMMARY ====");
+    for line in summary {
+        eprintln!("[diag] {line}");
     }
     eprintln!("[diag] exiting 1 on purpose so the log is shown");
     std::process::exit(1);

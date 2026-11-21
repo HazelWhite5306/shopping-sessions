@@ -44,8 +44,32 @@ const SHARDS: usize = 64;
 const BUCKETS: usize = 256;
 const NO_CATEGORY: u16 = u16::MAX;
 
+/// Every log line, kept so the diagnostic mode can repeat them in its summary.
+static LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 fn log(start: Instant, what: &str) {
-    eprintln!("[{:>7.3}s] {what}", start.elapsed().as_secs_f64());
+    let line = format!("{:.3} {what}", start.elapsed().as_secs_f64());
+    eprintln!("[{line}]");
+    if let Ok(mut lines) = LOG.lock() {
+        lines.push(line);
+    }
+}
+
+/// The phase log since the last call, as one compact line.
+fn take_log() -> String {
+    let mut lines = LOG.lock().unwrap();
+    let text = lines
+        .iter()
+        .map(|line| {
+            let mut parts = line.splitn(3, ' ');
+            let time = parts.next().unwrap_or("");
+            let word = parts.next().unwrap_or("");
+            format!("{word}={time}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    lines.clear();
+    text
 }
 
 /// mimalloc options, by their index in mimalloc.h's `mi_option_e`.
@@ -82,13 +106,12 @@ fn main() {
         return;
     }
     let diagnose = std::env::var("SESSIONS_DIAG").as_deref() == Ok("1");
-    if diagnose {
-        diag::before(&data, start);
-    }
+    let first = diagnose.then(|| diag::before(&data, start));
     run(&data, &output, start);
     log(start, "done");
-    if diagnose {
-        diag::after(&data, &output, run);
+    if let Some(first) = first {
+        let cold_log = take_log();
+        diag::after(&data, &output, first, cold_log, run, take_log);
     }
     // Every output file is closed; skip freeing memory and unmapping files.
     std::process::exit(0);
