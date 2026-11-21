@@ -5,6 +5,8 @@
 //! Every phase runs in parallel: chunks are parsed straight into hash shards,
 //! events are deduplicated per shard, user IDs are interned per shard, and
 //! people are regrouped into buckets that are sessionized independently.
+//! Rows hold text fields as packed 8-byte references into the memory-mapped
+//! files, and shards are read in place, so memory stays small.
 
 mod csv;
 mod out;
@@ -12,6 +14,7 @@ mod ts;
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use hashbrown::HashTable;
@@ -54,6 +57,50 @@ fn main() {
         .ok();
     run(&data, &output, start);
     log(start, "done");
+    // Every output file is closed; skip freeing memory and unmapping files.
+    std::process::exit(0);
+}
+
+/// Frees a large value on a background thread, off the critical path.
+fn discard<T: Send + 'static>(value: T) {
+    std::thread::spawn(move || drop(value));
+}
+
+// ---------------------------------------------------------------- packed text
+
+/// A byte string inside a memory-mapped input file, packed into 8 bytes:
+/// the address in the high 48 bits and the length in the low 16. A field of
+/// 65,535 bytes or more goes to a side table instead. The maps live until the
+/// process exits, so the bytes stay valid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Text(u64);
+
+static LONG_TEXT: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+const LONG: u64 = 0xFFFF;
+
+impl Text {
+    #[inline]
+    fn new(s: &[u8]) -> Text {
+        let address = s.as_ptr() as u64;
+        if s.len() < LONG as usize && address < (1 << 48) {
+            Text(address << 16 | s.len() as u64)
+        } else {
+            let mut long = LONG_TEXT.lock().unwrap();
+            long.push((s.as_ptr() as usize, s.len()));
+            Text(((long.len() - 1) as u64) << 16 | LONG)
+        }
+    }
+
+    #[inline]
+    fn get(self) -> &'static [u8] {
+        let len = self.0 & 0xFFFF;
+        if len != LONG {
+            unsafe { std::slice::from_raw_parts((self.0 >> 16) as *const u8, len as usize) }
+        } else {
+            let (address, len) = LONG_TEXT.lock().unwrap()[(self.0 >> 16) as usize];
+            unsafe { std::slice::from_raw_parts(address as *const u8, len) }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- hashing
@@ -250,13 +297,11 @@ impl<'a> Lookup<'a> {
 
 // ---------------------------------------------------------------- rows
 
-/// One parsed copy of an event, before dedup.
+/// One parsed copy of an event, before dedup (40 bytes).
 #[derive(Clone, Copy)]
-struct EventCopy<'a> {
-    event_id: &'a [u8],
-    user_id: &'a [u8],
-    event_hash: u64,
-    user_hash: u64,
+struct EventCopy {
+    event_id: Text,
+    user_id: Text,
     ts: i64,
     ingest: i64,
     /// Price for a valid purchase, 0 for view and cart.
@@ -267,8 +312,8 @@ struct EventCopy<'a> {
 
 /// A kept, valid event, before its user ID is interned.
 #[derive(Clone, Copy)]
-struct LiveEvent<'a> {
-    user_id: &'a [u8],
+struct LiveEvent {
+    user_id: Text,
     user_hash: u64,
     ts: i64,
     price: u32,
@@ -276,15 +321,15 @@ struct LiveEvent<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct ValidClick<'a> {
-    user_id: &'a [u8],
+struct ValidClick {
+    user_id: Text,
     user_hash: u64,
-    click_id: &'a [u8],
+    click_id: Text,
     ts: i64,
     campaign: u16,
 }
 
-/// An event or click whose user ID is now a number (an ID, then a person).
+/// An event whose user ID is now a number (an ID, then a person).
 #[derive(Clone, Copy)]
 struct PersonEvent {
     person: u32,
@@ -294,11 +339,11 @@ struct PersonEvent {
 }
 
 #[derive(Clone, Copy)]
-struct PersonClick<'a> {
+struct PersonClick {
     person: u32,
     campaign: u16,
     ts: i64,
-    click_id: &'a [u8],
+    click_id: Text,
 }
 
 #[inline]
@@ -327,8 +372,9 @@ struct Context<'a> {
     campaigns: Lookup<'a>,
 }
 
+/// Parses an event line; returns the copy and its event-ID hash.
 #[inline]
-fn parse_event<'a>(line: &'a [u8], context: &Context) -> Option<EventCopy<'a>> {
+fn parse_event(line: &[u8], context: &Context) -> Option<(EventCopy, u64)> {
     let [event_id, user_id, ts_field, ingest_field, kind, product, price] = csv::split::<7>(line)?;
     if event_id.is_empty() {
         return None;
@@ -355,32 +401,30 @@ fn parse_event<'a>(line: &'a [u8], context: &Context) -> Option<EventCopy<'a>> {
     if valid && ingest - ts > LATE {
         valid = false;
     }
-    let (category, user_hash) = if valid {
-        (
-            context
-                .products
-                .get(product)
-                .unwrap_or(context.unknown_category),
-            hash_bytes(user_id),
-        )
+    let category = if valid {
+        context
+            .products
+            .get(product)
+            .unwrap_or(context.unknown_category)
     } else {
-        (0, 0)
+        0
     };
-    Some(EventCopy {
-        event_id,
-        user_id,
-        event_hash: hash_bytes(event_id),
-        user_hash,
-        ts,
-        ingest,
-        price: price_cents,
-        category,
-        valid,
-    })
+    Some((
+        EventCopy {
+            event_id: Text::new(event_id),
+            user_id: Text::new(user_id),
+            ts,
+            ingest,
+            price: price_cents,
+            category,
+            valid,
+        },
+        hash_bytes(event_id),
+    ))
 }
 
 #[inline]
-fn parse_click<'a>(line: &'a [u8], context: &Context) -> Option<ValidClick<'a>> {
+fn parse_click(line: &[u8], context: &Context) -> Option<ValidClick> {
     let [click_id, user_id, campaign, ts_field] = csv::split::<4>(line)?;
     if click_id.is_empty() || user_id.is_empty() {
         return None;
@@ -391,9 +435,9 @@ fn parse_click<'a>(line: &'a [u8], context: &Context) -> Option<ValidClick<'a>> 
         return None;
     }
     Some(ValidClick {
-        user_id,
+        user_id: Text::new(user_id),
         user_hash: hash_bytes(user_id),
-        click_id,
+        click_id: Text::new(click_id),
         ts,
         campaign,
     })
@@ -408,44 +452,29 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-/// Moves `items` (one Vec of shards per producer) into one Vec per shard.
-fn transpose<T: Send>(producers: Vec<Vec<Vec<T>>>, shards: usize) -> Vec<Vec<T>> {
-    let mut by_shard: Vec<Vec<Vec<T>>> = (0..shards).map(|_| Vec::new()).collect();
-    for producer in producers {
-        for (at, part) in producer.into_iter().enumerate() {
-            by_shard[at].push(part);
-        }
-    }
-    by_shard
-        .into_par_iter()
-        .map(|parts| {
-            let total = parts.iter().map(Vec::len).sum();
-            let mut joined = Vec::with_capacity(total);
-            for mut part in parts {
-                joined.append(&mut part);
-            }
-            joined
-        })
-        .collect()
+/// `shards` empty Vecs, each with room for `each` items.
+fn shard_vecs<T>(shards: usize, each: usize) -> Vec<Vec<T>> {
+    (0..shards).map(|_| Vec::with_capacity(each)).collect()
 }
 
-struct Interner<'a> {
-    names: Vec<&'a [u8]>,
+struct Interner {
+    names: Vec<Text>,
     hashes: Vec<u64>,
     table: HashTable<u32>,
 }
 
-impl<'a> Interner<'a> {
+impl Interner {
     #[inline]
-    fn intern(&mut self, id: &'a [u8], hash: u64) -> u32 {
+    fn intern(&mut self, id: Text, hash: u64) -> u32 {
         let Self {
             names,
             hashes,
             table,
         } = self;
+        let bytes = id.get();
         match table.entry(
             hash,
-            |&at| names[at as usize] == id,
+            |&at| names[at as usize].get() == bytes,
             |&at| hashes[at as usize],
         ) {
             Entry::Occupied(entry) => *entry.get(),
@@ -461,12 +490,12 @@ impl<'a> Interner<'a> {
 }
 
 /// One user shard's interned IDs and rows.
-struct UserShard<'a> {
-    names: Vec<&'a [u8]>,
+struct UserShard {
+    names: Vec<Text>,
     /// (link side as link * 2 + side, local ID)
     link_sides: Vec<(u32, u32)>,
     events: Vec<PersonEvent>,
-    clicks: Vec<PersonClick<'a>>,
+    clicks: Vec<PersonClick>,
 }
 
 /// Per-thread results of the session pass.
@@ -532,18 +561,18 @@ fn run(data: &Path, output: &Path, start: Instant) {
     let link_chunks = chunks(&link_maps);
     log(start, "mapped");
 
-    // 1. Parse each chunk straight into shards.
+    // 1. Parse each chunk straight into shards: events by event ID, clicks by
+    //    user ID.
     let (events, (clicks, links)) = rayon::join(
         || {
             event_chunks
                 .par_iter()
                 .map(|chunk| {
-                    let mut shards: Vec<Vec<EventCopy>> = (0..SHARDS)
-                        .map(|_| Vec::with_capacity(chunk.len() / 80 / SHARDS + 16))
-                        .collect();
+                    let mut shards: Vec<Vec<EventCopy>> =
+                        shard_vecs(SHARDS, chunk.len() / 70 / SHARDS + 16);
                     csv::for_lines(chunk, |line| {
-                        if let Some(event) = parse_event(line, &context) {
-                            shards[shard(event.event_hash)].push(event);
+                        if let Some((event, hash)) = parse_event(line, &context) {
+                            shards[shard(hash)].push(event);
                         }
                     });
                     shards
@@ -556,9 +585,8 @@ fn run(data: &Path, output: &Path, start: Instant) {
                     click_chunks
                         .par_iter()
                         .map(|chunk| {
-                            let mut shards: Vec<Vec<ValidClick>> = (0..SHARDS)
-                                .map(|_| Vec::with_capacity(chunk.len() / 50 / SHARDS + 16))
-                                .collect();
+                            let mut shards: Vec<Vec<ValidClick>> =
+                                shard_vecs(SHARDS, chunk.len() / 45 / SHARDS + 16);
                             csv::for_lines(chunk, |line| {
                                 if let Some(click) = parse_click(line, &context) {
                                     shards[shard(click.user_hash)].push(click);
@@ -591,108 +619,116 @@ fn run(data: &Path, output: &Path, start: Instant) {
     );
     log(start, "parsed");
 
-    // 2. Dedup events per shard; keep valid survivors, sharded by user.
-    let events = transpose(events, SHARDS);
-    let clicks = transpose(clicks, SHARDS);
-    let live: Vec<Vec<Vec<LiveEvent>>> = events
-        .par_iter()
-        .map(|copies| {
-            let mut table: HashTable<u32> = HashTable::with_capacity(copies.len());
-            for (at, copy) in copies.iter().enumerate() {
-                match table.entry(
-                    copy.event_hash,
-                    |&kept| copies[kept as usize].event_id == copy.event_id,
-                    |&kept| copies[kept as usize].event_hash,
-                ) {
-                    Entry::Occupied(mut entry) => {
-                        let kept = entry.get_mut();
-                        if copy.ingest < copies[*kept as usize].ingest {
-                            *kept = at as u32;
+    // 2. Dedup events per shard, reading each chunk's part in place; keep
+    //    valid survivors, sharded by user ID.
+    let live: Vec<Vec<Vec<LiveEvent>>> = (0..SHARDS)
+        .into_par_iter()
+        .map(|at| {
+            let total: usize = events.iter().map(|chunk| chunk[at].len()).sum();
+            // Sized up front, so the table never grows and never rehashes.
+            let mut table: HashTable<&EventCopy> = HashTable::with_capacity(total);
+            for chunk in &events {
+                for copy in &chunk[at] {
+                    let id = copy.event_id.get();
+                    let hash = hash_bytes(id);
+                    match table.entry(
+                        hash,
+                        |kept| kept.event_id == copy.event_id || kept.event_id.get() == id,
+                        |kept| hash_bytes(kept.event_id.get()),
+                    ) {
+                        Entry::Occupied(mut entry) => {
+                            let kept = entry.get_mut();
+                            if copy.ingest < kept.ingest {
+                                *kept = copy;
+                            }
                         }
-                    }
-                    Entry::Vacant(entry) => {
-                        entry.insert(at as u32);
+                        Entry::Vacant(entry) => {
+                            entry.insert(copy);
+                        }
                     }
                 }
             }
-            let mut out: Vec<Vec<LiveEvent>> = (0..SHARDS)
-                .map(|_| Vec::with_capacity(copies.len() / SHARDS + 16))
-                .collect();
-            for &kept in table.iter() {
-                let copy = &copies[kept as usize];
-                if copy.valid {
-                    out[shard(copy.user_hash)].push(LiveEvent {
-                        user_id: copy.user_id,
-                        user_hash: copy.user_hash,
-                        ts: copy.ts,
-                        price: copy.price,
-                        category: copy.category,
+            let mut out: Vec<Vec<LiveEvent>> = shard_vecs(SHARDS, total / SHARDS + 16);
+            for kept in table.iter() {
+                if kept.valid {
+                    let user_hash = hash_bytes(kept.user_id.get());
+                    out[shard(user_hash)].push(LiveEvent {
+                        user_id: kept.user_id,
+                        user_hash,
+                        ts: kept.ts,
+                        price: kept.price,
+                        category: kept.category,
                     });
                 }
             }
             out
         })
         .collect();
-    drop(events);
-    let live = transpose(live, SHARDS);
+    discard(events);
     log(start, "deduplicated");
 
-    // 3. Intern user IDs per shard.
-    let mut link_sides: Vec<Vec<(u32, &[u8], u64)>> = (0..SHARDS).map(|_| Vec::new()).collect();
+    // 3. Intern user IDs per shard, reading every producer's part in place.
+    let mut link_sides: Vec<Vec<(u32, Text, u64)>> = (0..SHARDS).map(|_| Vec::new()).collect();
     for (at, [a, b]) in links.iter().enumerate() {
         for (side, id) in [a, b].into_iter().enumerate() {
             let hash = hash_bytes(id);
-            link_sides[shard(hash)].push(((at * 2 + side) as u32, id, hash));
+            link_sides[shard(hash)].push(((at * 2 + side) as u32, Text::new(id), hash));
         }
     }
-    let mut users: Vec<UserShard> = live
+    let mut users: Vec<UserShard> = link_sides
         .into_par_iter()
-        .zip(clicks.into_par_iter())
-        .zip(link_sides.into_par_iter())
-        .map(|((live, clicks), sides)| {
+        .enumerate()
+        .map(|(at, sides)| {
+            let event_count: usize = live.iter().map(|part| part[at].len()).sum();
+            let click_count: usize = clicks.iter().map(|part| part[at].len()).sum();
             let mut ids = Interner {
                 names: Vec::new(),
                 hashes: Vec::new(),
-                table: HashTable::with_capacity((live.len() + clicks.len()) / 8 + sides.len() + 64),
+                table: HashTable::with_capacity((event_count + click_count) / 8 + sides.len() + 64),
             };
             let link_sides: Vec<(u32, u32)> = sides
                 .iter()
                 .map(|&(code, id, hash)| (code, ids.intern(id, hash)))
                 .collect();
-            let events: Vec<PersonEvent> = live
-                .iter()
-                .map(|event| PersonEvent {
-                    person: ids.intern(event.user_id, event.user_hash),
-                    price: event.price,
-                    ts: event.ts,
-                    category: event.category,
-                })
-                .collect();
-            let clicks: Vec<PersonClick> = clicks
-                .iter()
-                .map(|click| PersonClick {
-                    person: ids.intern(click.user_id, click.user_hash),
-                    campaign: click.campaign,
-                    ts: click.ts,
-                    click_id: click.click_id,
-                })
-                .collect();
-            let names = ids.names;
+            let mut events = Vec::with_capacity(event_count);
+            for part in &live {
+                for event in &part[at] {
+                    events.push(PersonEvent {
+                        person: ids.intern(event.user_id, event.user_hash),
+                        price: event.price,
+                        ts: event.ts,
+                        category: event.category,
+                    });
+                }
+            }
+            let mut person_clicks = Vec::with_capacity(click_count);
+            for part in &clicks {
+                for click in &part[at] {
+                    person_clicks.push(PersonClick {
+                        person: ids.intern(click.user_id, click.user_hash),
+                        campaign: click.campaign,
+                        ts: click.ts,
+                        click_id: click.click_id,
+                    });
+                }
+            }
             UserShard {
-                names,
+                names: ids.names,
                 link_sides,
                 events,
-                clicks,
+                clicks: person_clicks,
             }
         })
         .collect();
+    discard(live);
+    discard(clicks);
     let mut base = Vec::with_capacity(SHARDS);
     let mut count = 0usize;
     for user_shard in &users {
         base.push(count as u32);
         count += user_shard.names.len();
     }
-    let names: Vec<&[u8]> = users
+    let names: Vec<Text> = users
         .iter()
         .flat_map(|user_shard| user_shard.names.iter().copied())
         .collect();
@@ -712,7 +748,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
         if ra != rb {
             parent[rb as usize] = ra;
             let (sa, sb) = (smallest[ra as usize], smallest[rb as usize]);
-            if names[sb as usize] < names[sa as usize] {
+            if names[sb as usize].get() < names[sa as usize].get() {
                 smallest[ra as usize] = sb;
             }
         }
@@ -721,7 +757,6 @@ fn run(data: &Path, output: &Path, start: Instant) {
     for id in 0..count as u32 {
         person[id as usize] = smallest[find(&mut parent, id) as usize];
     }
-    drop(parent);
     log(start, &format!("linked {} pairs", links.len()));
 
     // 5. Regroup rows by person into buckets.
@@ -729,26 +764,21 @@ fn run(data: &Path, output: &Path, start: Instant) {
         .par_iter_mut()
         .zip(base.par_iter())
         .map(|(user_shard, &offset)| {
-            let mut events: Vec<Vec<PersonEvent>> = (0..BUCKETS)
-                .map(|_| Vec::with_capacity(user_shard.events.len() / BUCKETS + 8))
-                .collect();
-            for mut event in user_shard.events.drain(..) {
+            let mut events: Vec<Vec<PersonEvent>> =
+                shard_vecs(BUCKETS, user_shard.events.len() / BUCKETS * 5 / 4 + 8);
+            for mut event in std::mem::take(&mut user_shard.events) {
                 event.person = person[(offset + event.person) as usize];
                 events[bucket(event.person)].push(event);
             }
-            let mut clicks: Vec<Vec<PersonClick>> = (0..BUCKETS)
-                .map(|_| Vec::with_capacity(user_shard.clicks.len() / BUCKETS + 8))
-                .collect();
-            for mut click in user_shard.clicks.drain(..) {
+            let mut clicks: Vec<Vec<PersonClick>> =
+                shard_vecs(BUCKETS, user_shard.clicks.len() / BUCKETS * 5 / 4 + 8);
+            for mut click in std::mem::take(&mut user_shard.clicks) {
                 click.person = person[(offset + click.person) as usize];
                 clicks[bucket(click.person)].push(click);
             }
             (events, clicks)
         })
         .collect();
-    let (event_parts, click_parts): (Vec<_>, Vec<_>) = regrouped.into_iter().unzip();
-    let event_buckets = transpose(event_parts, BUCKETS);
-    let click_buckets = transpose(click_parts, BUCKETS);
     log(start, "regrouped");
 
     // 6. Sessions, credit and assists, per bucket.
@@ -761,13 +791,24 @@ fn run(data: &Path, output: &Path, start: Instant) {
         stamp: vec![u64::MAX; campaign_slots],
         session: 0,
     };
-    let tally = event_buckets
+    let tally = (0..BUCKETS)
         .into_par_iter()
-        .zip(click_buckets.into_par_iter())
-        .fold(empty_tally, |mut tally, (mut events, mut clicks)| {
+        .fold(empty_tally, |mut tally, at| {
+            let event_count = regrouped.iter().map(|(e, _)| e[at].len()).sum();
+            let mut events: Vec<PersonEvent> = Vec::with_capacity(event_count);
+            for (part, _) in &regrouped {
+                events.extend_from_slice(&part[at]);
+            }
+            let click_count = regrouped.iter().map(|(_, c)| c[at].len()).sum();
+            let mut clicks: Vec<PersonClick> = Vec::with_capacity(click_count);
+            for (_, part) in &regrouped {
+                clicks.extend_from_slice(&part[at]);
+            }
             events.sort_unstable_by_key(|e| (e.person, e.ts));
             clicks.sort_unstable_by(|a, b| {
-                (a.person, a.ts, a.click_id).cmp(&(b.person, b.ts, b.click_id))
+                (a.person, a.ts)
+                    .cmp(&(b.person, b.ts))
+                    .then_with(|| a.click_id.get().cmp(b.click_id.get()))
             });
             sessionize(
                 &events,
@@ -790,6 +831,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
             a.session += b.session;
             a
         });
+    discard(regrouped);
     log(start, &format!("sessions: {}", tally.session));
 
     // 7. Write both tables.
@@ -797,7 +839,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
         .users
         .par_iter()
         .map(|&(who, day, sessions, events, revenue, top)| UserRow {
-            user_id: names[who as usize].to_vec(),
+            user_id: names[who as usize].get().to_vec(),
             day,
             sessions: i64::from(sessions),
             events: i64::from(events),
@@ -841,6 +883,8 @@ fn run(data: &Path, output: &Path, start: Instant) {
             campaign_rows.len()
         ),
     );
+    // The maps must outlive every Text; main exits without unmapping them.
+    std::mem::forget((event_maps, click_maps, link_maps));
 }
 
 /// Walks one bucket's events (sorted by person, ts) and clicks (sorted by
