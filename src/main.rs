@@ -314,6 +314,7 @@ struct Lookup<'a> {
 
 impl<'a> Lookup<'a> {
     fn new(prefix: &'static [u8]) -> Self {
+        assert!(prefix.len() == 1 || prefix.len() == 2);
         Self {
             prefix,
             by_number: Vec::new(),
@@ -321,20 +322,24 @@ impl<'a> Lookup<'a> {
         }
     }
 
+    /// `n` for an ID that is exactly the prefix and 1 to 7 digits without a
+    /// leading zero. Prefixes are 1 or 2 bytes.
     #[inline]
     fn number(&self, id: &[u8]) -> Option<usize> {
-        let digits = id.strip_prefix(self.prefix)?;
-        if digits.is_empty() || digits.len() > 7 || digits[0] == b'0' {
+        let p = self.prefix.len();
+        let n = id.len();
+        if n <= p || n > p + 7 || id[0] != self.prefix[0] || (p == 2 && id[1] != self.prefix[1]) {
             return None;
         }
-        let mut n = 0usize;
+        let digits = &id[p..];
+        let mut value = 0usize;
+        let mut bad = digits[0] == b'0';
         for &b in digits {
-            if !b.is_ascii_digit() {
-                return None;
-            }
-            n = n * 10 + usize::from(b - b'0');
+            let digit = b.wrapping_sub(b'0');
+            bad |= digit > 9;
+            value = value * 10 + usize::from(digit);
         }
-        Some(n)
+        if bad { None } else { Some(value) }
     }
 
     fn insert(&mut self, id: &'a [u8], value: u16) {

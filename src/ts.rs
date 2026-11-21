@@ -112,29 +112,43 @@ impl Parser {
     }
 
     /// The UTC-naive milliseconds of `YYYY-MM-DDTHH:MM:SS` at the start of
-    /// `s` (19 bytes or more), or None if any part is invalid.
+    /// `s` (20 bytes or more), or None if any part is invalid. Reads the 19
+    /// bytes as words: separators are checked by mask, then replaced by '0'
+    /// so one SWAR test checks every digit at once.
     #[inline]
     fn civil(&mut self, s: &[u8]) -> Option<i64> {
-        let digit = |at: usize| s[at].wrapping_sub(b'0');
-        let digits: [u8; 14] = [
-            digit(0), digit(1), digit(2), digit(3), digit(5), digit(6), digit(8), digit(9),
-            digit(11), digit(12), digit(14), digit(15), digit(17), digit(18),
-        ];
-        let mut bad = (s[4] != b'-') | (s[7] != b'-') | (s[10] != b'T');
-        bad |= (s[13] != b':') | (s[16] != b':');
-        for d in digits {
-            bad |= d > 9;
-        }
-        if bad {
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        // "YYYY-MM-": separators at bytes 4 and 7.
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        const A_MASK: u64 = 0xFF << 32 | 0xFF << 56;
+        const A_SEP: u64 = (b'-' as u64) << 32 | (b'-' as u64) << 56;
+        // "DDTHH:MM": separators at bytes 2 and 5.
+        let b = u64::from_le_bytes(s[8..16].try_into().unwrap());
+        const B_MASK: u64 = 0xFF << 16 | 0xFF << 40;
+        const B_SEP: u64 = (b'T' as u64) << 16 | (b':' as u64) << 40;
+        // ":SS?": separator at byte 0; byte 3 is the zone, checked by the caller.
+        let c = u64::from(u32::from_le_bytes(s[16..20].try_into().unwrap()));
+        const C_MASK: u64 = 0xFF | 0xFF << 24 | 0xFFFF_FFFF << 32;
+        const C_SEP: u64 = b':' as u64;
+        let zeros = 0x30 * ONES;
+        if (a & A_MASK) != A_SEP || (b & B_MASK) != B_SEP || (c & 0xFF) != C_SEP {
             return None;
         }
-        let two = |at: usize| i64::from(digits[at]) * 10 + i64::from(digits[at + 1]);
-        let year = two(0) * 100 + two(2);
-        let month = two(4);
-        let day = two(6);
-        let hour = two(8);
-        let minute = two(10);
-        let second = two(12);
+        let a = (a & !A_MASK) | (zeros & A_MASK);
+        let b = (b & !B_MASK) | (zeros & B_MASK);
+        let c = (c & !C_MASK) | (zeros & C_MASK);
+        let not_digit = |x: u64| (x.wrapping_add(0x46 * ONES) | x.wrapping_sub(zeros)) & (0x80 * ONES);
+        if not_digit(a) | not_digit(b) | not_digit(c) != 0 {
+            return None;
+        }
+        let (a, b, c) = (a - zeros, b - zeros, c - zeros);
+        let byte = |x: u64, at: u32| ((x >> (8 * at)) & 0xFF) as i64;
+        let year = byte(a, 0) * 1000 + byte(a, 1) * 100 + byte(a, 2) * 10 + byte(a, 3);
+        let month = byte(a, 5) * 10 + byte(a, 6);
+        let day = byte(b, 0) * 10 + byte(b, 1);
+        let hour = byte(b, 3) * 10 + byte(b, 4);
+        let minute = byte(b, 6) * 10 + byte(b, 7);
+        let second = byte(c, 1) * 10 + byte(c, 2);
         if !(1..=12).contains(&month) || day < 1 || hour > 23 || minute > 59 || second > 59 {
             return None;
         }
@@ -160,6 +174,20 @@ impl Parser {
             return None;
         }
         if n != 20 && n != 25 {
+            // F3 of up to 18 digits cannot overflow; anything else goes to
+            // the reference parser.
+            if n <= 18 {
+                let mut value: i64 = 0;
+                let mut bad = false;
+                for &b in s {
+                    let digit = b.wrapping_sub(b'0');
+                    bad |= digit > 9;
+                    value = value.wrapping_mul(10).wrapping_add(i64::from(digit));
+                }
+                if !bad {
+                    return Some(value);
+                }
+            }
             return parse(s);
         }
         if n == 20 {
@@ -303,14 +331,14 @@ mod tests {
             b"2027-02-28T23:59:59Z",
             b"2026-12-31T00:00:00-00:00",
         ];
-        let alphabet = b"0123456789-T:Z+zt .";
+        let alphabet = b"0123456789-T:Z+zt ./\xff\x80\xd9\x7f\x00";
         let mut state: u64 = 42;
         let mut next = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (state >> 33) as usize
         };
         let mut parser = Parser::new();
-        for _ in 0..200_000 {
+        for _ in 0..1_000_000 {
             let mut s = seeds[next() % seeds.len()].to_vec();
             for _ in 0..next() % 3 {
                 let at = next() % s.len();
