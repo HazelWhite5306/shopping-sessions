@@ -931,10 +931,25 @@ fn run(data: &Path, output: &Path, start: Instant) {
             }
         }
     }
+    // Number each person within their bucket, so the session phase indexes
+    // small bucket-local arrays. person[id] = bucket << 24 | local index;
+    // bucket_people[bucket][local] is the person's name ID.
     let mut person = vec![0u32; count];
+    let mut local = vec![u32::MAX; count];
+    let mut bucket_people: Vec<Vec<u32>> = (0..BUCKETS).map(|_| Vec::new()).collect();
     for id in 0..count as u32 {
-        person[id as usize] = smallest[find(&mut parent, id) as usize];
+        let name = smallest[find(&mut parent, id) as usize];
+        let at = bucket(name);
+        if local[name as usize] == u32::MAX {
+            local[name as usize] = bucket_people[at].len() as u32;
+            bucket_people[at].push(name);
+        }
+        person[id as usize] = (at as u32) << 24 | local[name as usize];
     }
+    assert!(
+        bucket_people.iter().all(|people| people.len() < 1 << 24),
+        "too many people in one bucket"
+    );
     log(start, &format!("linked {} pairs", links.len()));
 
     // 5. Regroup rows by person into buckets.
@@ -945,14 +960,16 @@ fn run(data: &Path, output: &Path, start: Instant) {
             let mut events: Vec<Vec<PersonEvent>> =
                 shard_vecs(BUCKETS, user_shard.events.len() / BUCKETS * 5 / 4 + 8);
             for mut event in std::mem::take(&mut user_shard.events) {
-                event.person = person[(offset + event.person) as usize];
-                events[bucket(event.person)].push(event);
+                let code = person[(offset + event.person) as usize];
+                event.person = code & 0xFF_FFFF;
+                events[(code >> 24) as usize].push(event);
             }
             let mut clicks: Vec<Vec<PersonClick>> =
                 shard_vecs(BUCKETS, user_shard.clicks.len() / BUCKETS * 5 / 4 + 8);
             for mut click in std::mem::take(&mut user_shard.clicks) {
-                click.person = person[(offset + click.person) as usize];
-                clicks[bucket(click.person)].push(click);
+                let code = person[(offset + click.person) as usize];
+                click.person = code & 0xFF_FFFF;
+                clicks[(code >> 24) as usize].push(click);
             }
             (events, clicks)
         })
@@ -970,85 +987,64 @@ fn run(data: &Path, output: &Path, start: Instant) {
         stamp: vec![u64::MAX; campaign_slots],
         session: 0,
     };
-    // Each person belongs to exactly one bucket, so a slot per person can be
-    // shared across threads without overlap: first an event count, then the
-    // person's index (plus one) in its bucket.
-    struct Slots(*mut u32);
-    unsafe impl Sync for Slots {}
-    unsafe impl Send for Slots {}
-    let mut slot_memory = vec![0u32; count];
-    let slots = Slots(slot_memory.as_mut_ptr());
-    let slots = &slots;
     let tally = (0..BUCKETS)
         .into_par_iter()
         .fold(empty_tally, |mut tally, at| {
-            #[allow(clippy::mut_from_ref)]
-            let slot = |person: u32| unsafe { &mut *slots.0.add(person as usize) };
-            // Count each person's events and number the people.
-            let mut people: Vec<u32> = Vec::new();
+            // Rows carry bucket-local person numbers: count, then place each
+            // row in its person's range, with small arrays that stay in cache.
+            let people = bucket_people[at].len();
+            let mut starts = vec![0usize; people + 1];
             for (part, _) in &regrouped {
                 for event in &part[at] {
-                    let count = slot(event.person);
-                    if *count == 0 {
-                        people.push(event.person);
-                    }
-                    *count += 1;
+                    starts[event.person as usize + 1] += 1;
                 }
             }
-            let mut starts: Vec<usize> = Vec::with_capacity(people.len() + 1);
-            let mut total = 0usize;
-            for (index, &person) in people.iter().enumerate() {
-                let count = slot(person);
-                starts.push(total);
-                total += *count as usize;
-                *count = index as u32 + 1;
+            for index in 0..people {
+                starts[index + 1] += starts[index];
             }
-            starts.push(total);
-            // Place every event in its person's range, once.
+            let total = starts[people];
             let mut events: Vec<PersonEvent> = Vec::with_capacity(total);
             let mut cursor = starts.clone();
             unsafe {
                 let target = events.as_mut_ptr();
                 for (part, _) in &regrouped {
                     for event in &part[at] {
-                        let index = *slot(event.person) as usize - 1;
+                        let index = event.person as usize;
                         target.add(cursor[index]).write(*event);
                         cursor[index] += 1;
                     }
                 }
                 events.set_len(total);
             }
-            // The same for clicks of people with events; the rest never count.
-            let mut click_starts = vec![0usize; people.len() + 1];
+            let mut click_starts = vec![0usize; people + 1];
             for (_, part) in &regrouped {
                 for click in &part[at] {
-                    let index = *slot(click.person) as usize;
-                    if index != 0 {
-                        click_starts[index] += 1;
-                    }
+                    click_starts[click.person as usize + 1] += 1;
                 }
             }
-            for index in 0..people.len() {
+            for index in 0..people {
                 click_starts[index + 1] += click_starts[index];
             }
-            let click_total = click_starts[people.len()];
+            let click_total = click_starts[people];
             let mut clicks: Vec<PersonClick> = Vec::with_capacity(click_total);
             let mut cursor = click_starts.clone();
             unsafe {
                 let target = clicks.as_mut_ptr();
                 for (_, part) in &regrouped {
                     for click in &part[at] {
-                        let index = *slot(click.person) as usize;
-                        if index != 0 {
-                            target.add(cursor[index - 1]).write(*click);
-                            cursor[index - 1] += 1;
-                        }
+                        let index = click.person as usize;
+                        target.add(cursor[index]).write(*click);
+                        cursor[index] += 1;
                     }
                 }
                 clicks.set_len(click_total);
             }
             // Each person's few events by ts, and clicks by (ts, click_id).
-            for index in 0..people.len() {
+            for index in 0..people {
+                if starts[index] == starts[index + 1] {
+                    // A person with only clicks or links has no sessions.
+                    continue;
+                }
                 let mine = &mut events[starts[index]..starts[index + 1]];
                 mine.sort_unstable_by_key(|e| e.ts);
                 let their_clicks = &mut clicks[click_starts[index]..click_starts[index + 1]];
@@ -1062,6 +1058,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
                     organic,
                     &category_rank,
                     window_start,
+                    bucket_people[at][index],
                 );
             }
             tally
@@ -1155,6 +1152,7 @@ fn sessionize(
     organic: usize,
     category_rank: &[u16],
     window_start: i64,
+    name: u32,
 ) {
     let mut sums = std::mem::take(&mut tally.sums);
     let mut click_at = 0;
@@ -1192,7 +1190,7 @@ fn sessionize(
             if let Some(r) = row
                 && r.0 != day
             {
-                emit(tally, who, r, &mut sums, category_rank);
+                emit(tally, name, r, &mut sums, category_rank);
                 row = None;
             }
             let mut revenue: u64 = 0;
@@ -1238,7 +1236,7 @@ fn sessionize(
             s = e;
         }
         if let Some(r) = row {
-            emit(tally, who, r, &mut sums, category_rank);
+            emit(tally, name, r, &mut sums, category_rank);
         }
         at = end;
     }
