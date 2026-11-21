@@ -751,40 +751,62 @@ fn run(data: &Path, output: &Path, start: Instant) {
 
     // 2. Dedup events per shard, reading each chunk's part in place; keep
     //    valid survivors, sharded by user ID.
+    // Losing copies are marked INVALID in place, then survivors are read in
+    // file order, so reading each user ID back from the input streams forward.
+    struct Rows(*mut Vec<Vec<EventCopy>>);
+    unsafe impl Sync for Rows {}
+    unsafe impl Send for Rows {}
+    let mut events = events;
+    let chunk_count = events.len();
+    let rows = Rows(events.as_mut_ptr());
+    let rows = &rows;
     let live: Vec<Vec<Vec<LiveEvent>>> = (0..SHARDS)
         .into_par_iter()
         .map(|at| {
-            let total: usize = events.iter().map(|chunk| chunk[at].len()).sum();
+            // Every chunk's part `at` belongs to this thread alone.
+            let part = |chunk: usize| unsafe { &mut (&mut *rows.0.add(chunk))[at] };
+            let total: usize = (0..chunk_count).map(|chunk| part(chunk).len()).sum();
             // Sized up front, so the table never grows and never rehashes.
-            let mut table: HashTable<&EventCopy> = HashTable::with_capacity(total);
-            for chunk in &events {
-                for copy in &chunk[at] {
+            let mut table: HashTable<*mut EventCopy> = HashTable::with_capacity(total);
+            for chunk in 0..chunk_count {
+                let copies = part(chunk);
+                let base = copies.as_mut_ptr();
+                for index in 0..copies.len() {
+                    let copy = unsafe { base.add(index) };
+                    let id = unsafe { (*copy).event_id };
                     match table.entry(
-                        copy.event_id.hash(),
-                        |kept| kept.event_id == copy.event_id,
-                        |kept| kept.event_id.hash(),
+                        id.hash(),
+                        |&kept| unsafe { (*kept).event_id } == id,
+                        |&kept| unsafe { (*kept).event_id.hash() },
                     ) {
-                        Entry::Occupied(mut entry) => {
-                            let kept = entry.get_mut();
-                            if copy.ingest < kept.ingest {
-                                *kept = copy;
+                        Entry::Occupied(mut entry) => unsafe {
+                            let kept = *entry.get();
+                            if (*copy).ingest < (*kept).ingest {
+                                (*kept).price_category = INVALID;
+                                *entry.get_mut() = copy;
+                            } else {
+                                // Equal ingest_ts means identical copies.
+                                (*copy).price_category = INVALID;
                             }
-                        }
+                        },
                         Entry::Vacant(entry) => {
                             entry.insert(copy);
                         }
                     }
                 }
             }
+            drop(table);
             let mut out: Vec<Vec<LiveEvent>> = shard_vecs(SHARDS, total / SHARDS + 16);
-            for kept in table.iter() {
-                if kept.price_category != INVALID {
-                    let user_id = Key::new(kept.user_id.get());
-                    out[shard(user_id.hash())].push(LiveEvent {
-                        user_id,
-                        ts: kept.ts,
-                        price_category: kept.price_category,
-                    });
+            for chunk in 0..chunk_count {
+                for kept in part(chunk).iter() {
+                    if kept.price_category != INVALID {
+                        let user_id = Key::new(kept.user_id.get());
+                        out[shard(user_id.hash())].push(LiveEvent {
+                            user_id,
+                            ts: kept.ts,
+                            price_category: kept.price_category,
+                        });
+                    }
                 }
             }
             out
