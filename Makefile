@@ -17,3 +17,8 @@ docker:
 	docker build --platform linux/amd64 -t sessions .
 
 .PHONY: build test check-dev docker
+
+fixtures: build
+	python3 tools/run_fixtures.py fixtures -- ./target/release/sessions
+
+.PHONY: fixtures
