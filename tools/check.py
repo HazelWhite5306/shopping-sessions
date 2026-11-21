@@ -2,9 +2,11 @@
 """Compare OUTPUT_DIR's two Parquet tables with an expected answer folder.
 
 usage: check.py OUTPUT_DIR ANSWER_DIR
-ANSWER_DIR holds user_daily.csv and campaign_daily.csv (dev-answer.zip).
+ANSWER_DIR holds user_daily.csv and campaign_daily.csv (dev-answer.zip), or
+another run's user_daily/ and campaign_daily/ Parquet folders.
 Exits 1 and prints sample differences when anything differs.
 """
+import os
 import sys
 
 import duckdb
@@ -34,10 +36,16 @@ def main() -> int:
                  "campaign_id": "VARCHAR", "channel": "VARCHAR"}
         order = ORDER[table]
         columns = ", ".join(f"'{c}': '{types.get(c, 'BIGINT')}'" for c in order)
-        con.execute(
-            f"CREATE TABLE want_{table} AS SELECT * FROM read_csv('{answer}/{table}.csv', "
-            f"header=true, columns={{{columns}}}, nullstr='')"
-        )
+        if os.path.isdir(f"{answer}/{table}"):
+            con.execute(
+                f"CREATE TABLE want_{table} AS SELECT {', '.join(order)} "
+                f"FROM read_parquet('{answer}/{table}/*.parquet')"
+            )
+        else:
+            con.execute(
+                f"CREATE TABLE want_{table} AS SELECT * FROM read_csv('{answer}/{table}.csv', "
+                f"header=true, columns={{{columns}}}, nullstr='')"
+            )
         con.execute(
             f"CREATE TABLE got_{table} AS SELECT {', '.join(keys + values)} "
             f"FROM read_parquet('{output}/{table}/*.parquet')"
