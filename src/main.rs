@@ -385,7 +385,6 @@ struct LiveEvent {
 #[derive(Clone, Copy)]
 struct ValidClick {
     user_id: Key,
-    user_hash: u64,
     click_id: Key,
     ts: i64,
     campaign: u16,
@@ -509,7 +508,6 @@ fn parse_click(fields: [&[u8]; 4], context: &Context, clock: &mut ts::Parser) ->
     let user_id = Key::new(user_id);
     Some(ValidClick {
         user_id,
-        user_hash: user_id.hash(),
         click_id: Key::new(click_id),
         ts,
         campaign,
@@ -530,31 +528,23 @@ fn shard_vecs<T>(shards: usize, each: usize) -> Vec<Vec<T>> {
     (0..shards).map(|_| Vec::with_capacity(each)).collect()
 }
 
+/// Numbers the user IDs of one shard. Entries hold the key itself, so a
+/// probe never reads `names`.
 struct Interner {
     names: Vec<Key>,
-    hashes: Vec<u64>,
-    table: HashTable<u32>,
+    table: HashTable<(Key, u32)>,
 }
 
 impl Interner {
     #[inline]
     fn intern(&mut self, id: Key, hash: u64) -> u32 {
-        let Self {
-            names,
-            hashes,
-            table,
-        } = self;
-        match table.entry(
-            hash,
-            |&at| names[at as usize] == id,
-            |&at| hashes[at as usize],
-        ) {
-            Entry::Occupied(entry) => *entry.get(),
+        let Self { names, table } = self;
+        match table.entry(hash, |entry| entry.0 == id, |entry| entry.0.hash()) {
+            Entry::Occupied(entry) => entry.get().1,
             Entry::Vacant(entry) => {
                 let at = names.len() as u32;
-                entry.insert(at);
+                entry.insert((id, at));
                 names.push(id);
-                hashes.push(hash);
                 at
             }
         }
@@ -722,7 +712,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
                             let mut clock = ts::Parser::new();
                             csv::for_records::<4>(chunk, |fields| {
                                 if let Some(click) = parse_click(fields, &context, &mut clock) {
-                                    shards[shard(click.user_hash)].push(click);
+                                    shards[shard(click.user_id.hash())].push(click);
                                 }
                             });
                             shards
@@ -829,7 +819,6 @@ fn run(data: &Path, output: &Path, start: Instant) {
             let click_count: usize = clicks.iter().map(|part| part[at].len()).sum();
             let mut ids = Interner {
                 names: Vec::new(),
-                hashes: Vec::new(),
                 table: HashTable::with_capacity((event_count + click_count) / 8 + sides.len() + 64),
             };
             let link_sides: Vec<(u32, u32)> = sides
@@ -850,7 +839,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
             for part in &clicks {
                 for click in &part[at] {
                     person_clicks.push(PersonClick {
-                        person: ids.intern(click.user_id, click.user_hash),
+                        person: ids.intern(click.user_id, click.user_id.hash()),
                         campaign: click.campaign,
                         ts: click.ts,
                         click_id: click.click_id,
