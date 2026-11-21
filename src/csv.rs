@@ -210,7 +210,7 @@ mod tests {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (state >> 33) as usize
         };
-        for round in 0..3000 {
+        for round in 0..20000 {
             let len = next() % 400;
             let mut data: Vec<u8> = (0..len).map(|_| alphabet[next() % alphabet.len()]).collect();
             // Some rounds use well-formed rows with quoted fields, like the generator.
@@ -226,8 +226,11 @@ mod tests {
                         if quoted {
                             data.push(b'"');
                         }
-                        for _ in 0..next() % 12 {
-                            data.push(b"xyz019 "[next() % 7]);
+                        let width = if next() % 4 == 0 { next() % 300 } else { next() % 12 };
+                        for _ in 0..width {
+                            // Rarely a stray quote inside, which makes the line malformed.
+                            let byte = if next() % 400 == 0 { b'"' } else { b"xyz019 "[next() % 7] };
+                            data.push(byte);
                         }
                         if quoted {
                             data.push(b'"');

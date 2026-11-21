@@ -592,6 +592,34 @@ fn run(data: &Path, output: &Path, start: Instant) {
             })
             .sum();
         log(start, &format!("split {fields} event lines"));
+        let valid: usize = event_chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut n = 0;
+                let mut clock = ts::Parser::new();
+                csv::for_records::<7>(chunk, |fields| {
+                    if let Some(event) = parse_event(fields, &context, &mut clock) {
+                        n += usize::from(event.valid) + (event.event_id.hash() as usize & 1);
+                    }
+                });
+                n
+            })
+            .sum();
+        log(start, &format!("parsed {valid} without storing"));
+        let stored: usize = event_chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut shards: Vec<Vec<EventCopy>> = shard_vecs(SHARDS, chunk.len() / 70 / SHARDS + 16);
+                let mut clock = ts::Parser::new();
+                csv::for_records::<7>(chunk, |fields| {
+                    if let Some(event) = parse_event(fields, &context, &mut clock) {
+                        shards[shard(event.event_id.hash())].push(event);
+                    }
+                });
+                shards.iter().map(Vec::len).sum::<usize>()
+            })
+            .sum();
+        log(start, &format!("parsed and stored {stored}"));
         std::process::exit(0);
     }
 
