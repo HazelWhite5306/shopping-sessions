@@ -1,5 +1,7 @@
+target/
+.git/
+tools/
+starter/
 fixtures/
-dev/
-out/
-*.md
-.git
+starter-polars/
+starter-pyspark/
