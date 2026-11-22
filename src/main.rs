@@ -713,7 +713,8 @@ struct UserShard {
 
 /// Per-thread results of the session pass.
 struct Tally {
-    users: Vec<(u32, i32, u32, u32, u64, u16)>,
+    /// (name, day, sessions, events, revenue, top category) per person-day.
+    users: Vec<(u64, i32, u32, u32, u64, u16)>,
     sums: Vec<(u16, u64)>,
     /// (sessions, purchasing, revenue, assisted) per campaign and day.
     campaigns: Vec<[i64; 4]>,
@@ -1236,7 +1237,7 @@ fn run(data: &Path, output: &Path, start: Instant) {
                         organic,
                         &category_rank,
                         window_start,
-                        bucket_people[at][index],
+                        u64::from(bucket_people[at][index]),
                     );
                 }
             }
@@ -1256,12 +1257,58 @@ fn run(data: &Path, output: &Path, start: Instant) {
     log(start, &format!("sessions: {}", tally.session));
 
     // 7. Write both tables.
-    let user_rows: &[out::UserRow] = &tally.users;
-    let write_name = |who: u32, buffer: &mut Vec<u8>| {
+    let write_name = |who: u64, buffer: &mut Vec<u8>| {
         names[who as usize].with_bytes(|bytes| buffer.extend_from_slice(bytes))
     };
+    let tables = Tables {
+        output,
+        category_names: &category_names,
+        campaign_ids: &campaign_ids,
+        campaign_channels: &campaign_channels,
+        organic,
+        first_day,
+        days,
+    };
+    write_tables(&tables, &tally, write_name, start);
+    // The maps must outlive every Text; main exits without unmapping them.
+    // The process exits right after: freeing millions of small buffers here
+    // took one thread ~65 ms at 20M, so everything large is left in place.
+    // The maps must outlive every Text anyway.
+    std::mem::forget((tally, names, users));
+    std::mem::forget((person, local, bucket_people, smallest, parent, link_ids, links));
+    std::mem::forget((event_maps, click_maps, link_maps));
+}
+
+/// What both pipelines need to write the output tables.
+struct Tables<'a> {
+    output: &'a Path,
+    category_names: &'a [&'a [u8]],
+    campaign_ids: &'a [&'a [u8]],
+    campaign_channels: &'a [&'a [u8]],
+    organic: usize,
+    first_day: i64,
+    days: usize,
+}
+
+/// Writes user_daily (several files in parallel) and campaign_daily.
+fn write_tables(
+    tables: &Tables,
+    tally: &Tally,
+    write_name: impl Fn(u64, &mut Vec<u8>) + Sync + Copy,
+    start: Instant,
+) {
+    let Tables {
+        output,
+        category_names,
+        campaign_ids,
+        campaign_channels,
+        organic,
+        first_day,
+        days,
+    } = *tables;
+    let user_rows: &[out::UserRow] = &tally.users;
     let mut campaign_rows = Vec::new();
-    for campaign in 0..campaign_slots {
+    for campaign in 0..=organic {
         for day_slot in 0..days {
             let [sessions, purchasing, revenue, assisted] =
                 tally.campaigns[campaign * days + day_slot];
@@ -1294,10 +1341,10 @@ fn run(data: &Path, output: &Path, start: Instant) {
                 .par_chunks(per_file)
                 .enumerate()
                 .for_each(|(part, rows)| {
-                    out::write_users(&user_dir, part, rows, write_name, &category_names, NO_CATEGORY)
+                    out::write_users(&user_dir, part, rows, write_name, category_names, NO_CATEGORY)
                 });
             if user_rows.is_empty() {
-                out::write_users(&user_dir, 0, &[], write_name, &category_names, NO_CATEGORY);
+                out::write_users(&user_dir, 0, &[], write_name, category_names, NO_CATEGORY);
             }
         },
         || out::write_campaigns(&output.join("campaign_daily"), &campaign_rows),
@@ -1310,27 +1357,44 @@ fn run(data: &Path, output: &Path, start: Instant) {
             campaign_rows.len()
         ),
     );
-    // The maps must outlive every Text; main exits without unmapping them.
-    // The process exits right after: freeing millions of small buffers here
-    // took one thread ~65 ms at 20M, so everything large is left in place.
-    // The maps must outlive every Text anyway.
-    std::mem::forget((campaign_rows, tally, names, users));
-    std::mem::forget((person, local, bucket_people, smallest, parent, link_ids, links));
-    std::mem::forget((event_maps, click_maps, link_maps));
+    std::mem::forget(campaign_rows);
+}
+
+/// What the session pass needs from a click: its person (as numbered in the
+/// slice), time and campaign.
+trait SessionClick {
+    fn person(&self) -> u32;
+    fn ts(&self) -> i64;
+    fn campaign(&self) -> u16;
+}
+
+impl SessionClick for PersonClick {
+    #[inline]
+    fn person(&self) -> u32 {
+        self.person
+    }
+    #[inline]
+    fn ts(&self) -> i64 {
+        self.ts
+    }
+    #[inline]
+    fn campaign(&self) -> u16 {
+        self.campaign
+    }
 }
 
 /// Walks one bucket's events (sorted by person, ts) and clicks (sorted by
 /// person, ts, click_id) into sessions, user-day rows and campaign tallies.
-fn sessionize(
+fn sessionize<C: SessionClick>(
     events: &[PersonEvent],
-    clicks: &[PersonClick],
+    clicks: &[C],
     tally: &mut Tally,
     first_day: i64,
     days: usize,
     organic: usize,
     category_rank: &[u16],
     window_start: i64,
-    name: u32,
+    name: u64,
 ) {
     let mut sums = std::mem::take(&mut tally.sums);
     let mut click_at = 0;
@@ -1341,11 +1405,11 @@ fn sessionize(
         while end < events.len() && events[end].person == who {
             end += 1;
         }
-        while click_at < clicks.len() && clicks[click_at].person < who {
+        while click_at < clicks.len() && clicks[click_at].person() < who {
             click_at += 1;
         }
         let mut click_end = click_at;
-        while click_end < clicks.len() && clicks[click_end].person == who {
+        while click_end < clicks.len() && clicks[click_end].person() == who {
             click_end += 1;
         }
         let mine = &clicks[click_at..click_end];
@@ -1389,12 +1453,12 @@ fn sessionize(
 
             // Credit and assists.
             let day_slot = (day - first_day) as usize;
-            let hi = mine.partition_point(|c| c.ts <= session_start);
-            let lo = mine[..hi].partition_point(|c| c.ts < session_start - WEEK);
+            let hi = mine.partition_point(|c| c.ts() <= session_start);
+            let lo = mine[..hi].partition_point(|c| c.ts() < session_start - WEEK);
             let credited = if hi > lo {
-                let latest = mine[hi - 1].ts;
-                let first = lo + mine[lo..hi].partition_point(|c| c.ts < latest);
-                usize::from(mine[first].campaign)
+                let latest = mine[hi - 1].ts();
+                let first = lo + mine[lo..hi].partition_point(|c| c.ts() < latest);
+                usize::from(mine[first].campaign())
             } else {
                 organic
             };
@@ -1404,7 +1468,7 @@ fn sessionize(
             cell[2] += revenue as i64;
             let session = tally.session;
             for click in &mine[lo..hi] {
-                let campaign = usize::from(click.campaign);
+                let campaign = usize::from(click.campaign());
                 if tally.stamp[campaign] != session {
                     tally.stamp[campaign] = session;
                     tally.campaigns[campaign * days + day_slot][3] += 1;
@@ -1424,7 +1488,7 @@ fn sessionize(
 #[inline]
 fn emit(
     tally: &mut Tally,
-    who: u32,
+    who: u64,
     (day, sessions, events, revenue): (i64, u32, u32, u64),
     sums: &mut Vec<(u16, u64)>,
     category_rank: &[u16],

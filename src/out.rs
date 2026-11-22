@@ -65,7 +65,7 @@ macro_rules! column {
 
 /// One user_daily row: (person, day, sessions, events, revenue, category),
 /// with category `no_category` for none.
-pub type UserRow = (u32, i32, u32, u32, u64, u16);
+pub type UserRow = (u64, i32, u32, u32, u64, u16);
 
 /// Writes one user_daily file. Every user ID goes into one shared buffer and
 /// each value is a slice of it, so no row allocates.
@@ -73,7 +73,7 @@ pub fn write_users(
     dir: &Path,
     part: usize,
     rows: &[UserRow],
-    write_name: impl Fn(u32, &mut Vec<u8>),
+    write_name: impl Fn(u64, &mut Vec<u8>),
     categories: &[&[u8]],
     no_category: u16,
 ) {
