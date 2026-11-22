@@ -1174,28 +1174,68 @@ fn run(data: &Path, output: &Path, start: Instant) {
                 // Rows carry bucket-local person numbers: count, then place each
                 // row in its person's range, with small arrays that stay in cache.
                 let people = bucket_people[at].len();
+                // One read of the bucket counts people and the three 11-bit
+                // digits of ts. An LSD radix sort by ts, then a stable
+                // placement by person, leaves each person's events in time
+                // order with no per-person sort.
                 let mut starts = vec![0usize; people + 1];
+                let mut digits = vec![[0usize; 2048]; 3];
                 for (part, _) in &regrouped {
                     for event in &part[at] {
                         starts[event.person as usize + 1] += 1;
+                        digits[0][(event.ts & 2047) as usize] += 1;
+                        digits[1][((event.ts >> 11) & 2047) as usize] += 1;
+                        digits[2][(event.ts >> 22) as usize & 2047] += 1;
                     }
                 }
                 for index in 0..people {
                     starts[index + 1] += starts[index];
                 }
                 let total = starts[people];
-                let mut events: Vec<PersonEvent> = Vec::with_capacity(total);
+                for histogram in digits.iter_mut() {
+                    let mut sum = 0;
+                    for slot in histogram.iter_mut() {
+                        let here = *slot;
+                        *slot = sum;
+                        sum += here;
+                    }
+                }
+                let mut sorted: Vec<PersonEvent> = Vec::with_capacity(total);
+                let mut spare: Vec<PersonEvent> = Vec::with_capacity(total);
+                unsafe {
+                    // Pass 1 reads the parts; passes 2 and 3 ping-pong.
+                    let target = spare.as_mut_ptr();
+                    for (part, _) in &regrouped {
+                        for event in &part[at] {
+                            let slot = &mut digits[0][(event.ts & 2047) as usize];
+                            target.add(*slot).write(*event);
+                            *slot += 1;
+                        }
+                    }
+                    spare.set_len(total);
+                    let target = sorted.as_mut_ptr();
+                    for event in &spare {
+                        let slot = &mut digits[1][((event.ts >> 11) & 2047) as usize];
+                        target.add(*slot).write(*event);
+                        *slot += 1;
+                    }
+                    sorted.set_len(total);
+                    let target = spare.as_mut_ptr();
+                    for event in &sorted {
+                        let slot = &mut digits[2][(event.ts >> 22) as usize & 2047];
+                        target.add(*slot).write(*event);
+                        *slot += 1;
+                    }
+                }
+                let mut events = sorted;
                 let mut cursor = starts.clone();
                 unsafe {
                     let target = events.as_mut_ptr();
-                    for (part, _) in &regrouped {
-                        for event in &part[at] {
-                            let index = event.person as usize;
-                            target.add(cursor[index]).write(*event);
-                            cursor[index] += 1;
-                        }
+                    for event in &spare {
+                        let index = event.person as usize;
+                        target.add(cursor[index]).write(*event);
+                        cursor[index] += 1;
                     }
-                    events.set_len(total);
                 }
                 let mut click_starts = vec![0usize; people + 1];
                 for (_, part) in &regrouped {
@@ -1226,8 +1266,8 @@ fn run(data: &Path, output: &Path, start: Instant) {
                         // A person with only clicks or links has no sessions.
                         continue;
                     }
+                    // Already in time order (radix sort, stable placement).
                     let mine = &mut events[starts[index]..starts[index + 1]];
-                    mine.sort_unstable_by_key(|e| e.ts);
                     let their_clicks = &mut clicks[click_starts[index]..click_starts[index + 1]];
                     their_clicks
                         .sort_unstable_by(|a, b| (a.ts, a.click_id).cmp(&(b.ts, b.click_id)));
