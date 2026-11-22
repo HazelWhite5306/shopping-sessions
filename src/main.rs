@@ -10,6 +10,7 @@
 
 mod csv;
 mod diag;
+mod fused;
 mod key;
 mod out;
 mod ts;
@@ -803,6 +804,37 @@ fn run(data: &Path, output: &Path, start: Instant) {
             .collect(),
     );
     log(start, "mapped");
+
+    // The main pipeline; it declines (writing nothing) when an ID does not
+    // pack into a u64, and the general pipeline below runs instead.
+    if std::env::var("SESSIONS_PATH").as_deref() != Ok("general") {
+        let first_day = window_start.div_euclid(DAY);
+        let days = ((window_end - 1).div_euclid(DAY) - first_day + 1).max(1) as usize;
+        let inputs = fused::Inputs {
+            work: &work,
+            maps: [&event_maps, &click_maps, &link_maps],
+            context: &context,
+            category_rank: &category_rank,
+            tables: Tables {
+                output,
+                category_names: &category_names,
+                campaign_ids: &campaign_ids,
+                campaign_channels: &campaign_channels,
+                organic,
+                first_day,
+                days,
+            },
+            window_start,
+            window_end,
+        };
+        let done = fused::run(&inputs, start);
+        drop(inputs);
+        if done {
+            std::mem::forget((event_maps, click_maps, link_maps));
+            return;
+        }
+        log(start, "an ID does not pack into 64 bits: general pipeline");
+    }
 
     // 1. Parse the pieces in order from a shared queue, straight into shards:
     //    events by event ID, clicks by user ID.
