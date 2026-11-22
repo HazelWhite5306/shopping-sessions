@@ -12,6 +12,7 @@ mod csv;
 mod diag;
 mod key;
 mod out;
+mod parquet_lite;
 mod ts;
 
 use std::fs::{self, File};

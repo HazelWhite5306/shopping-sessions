@@ -69,7 +69,41 @@ pub type UserRow = (u64, i32, u32, u32, u64, u16);
 
 /// Writes one user_daily file. Every user ID goes into one shared buffer and
 /// each value is a slice of it, so no row allocates.
+/// Writes one user_daily file with the minimal writer (the default) or, with
+/// SESSIONS_WRITER=crate, the parquet crate.
 pub fn write_users(
+    dir: &Path,
+    part: usize,
+    rows: &[UserRow],
+    write_name: impl Fn(u64, &mut Vec<u8>),
+    categories: &[&[u8]],
+    no_category: u16,
+) {
+    if std::env::var("SESSIONS_WRITER").as_deref() == Ok("crate") {
+        return write_users_crate(dir, part, rows, write_name, categories, no_category);
+    }
+    use crate::parquet_lite::{Column, Kind, write};
+    let n = rows.len();
+    let mut user_id = Column::new("user_id", Kind::Text, false, n);
+    let mut day = Column::new("day", Kind::Date, false, n);
+    let mut sessions = Column::new("sessions", Kind::Int64, false, n);
+    let mut events = Column::new("events", Kind::Int64, false, n);
+    let mut revenue = Column::new("revenue_cents", Kind::Int64, false, n);
+    let mut top = Column::new("top_category", Kind::Text, true, n);
+    for row in rows {
+        user_id.text_with(|out| write_name(row.0, out));
+        day.date(row.1);
+        sessions.int64(i64::from(row.2));
+        events.int64(i64::from(row.3));
+        revenue.int64(row.4 as i64);
+        top.text((row.5 != no_category).then(|| categories[row.5 as usize]));
+    }
+    let columns = [user_id, day, sessions, events, revenue, top];
+    write(dir, &format!("part-{part}.parquet"), n, &columns);
+    std::mem::forget(columns);
+}
+
+fn write_users_crate(
     dir: &Path,
     part: usize,
     rows: &[UserRow],
@@ -133,6 +167,32 @@ pub fn write_users(
 }
 
 pub fn write_campaigns(dir: &Path, rows: &[CampaignRow]) {
+    if std::env::var("SESSIONS_WRITER").as_deref() == Ok("crate") {
+        return write_campaigns_crate(dir, rows);
+    }
+    use crate::parquet_lite::{Column, Kind, write};
+    let n = rows.len();
+    let mut campaign_id = Column::new("campaign_id", Kind::Text, false, n);
+    let mut channel = Column::new("channel", Kind::Text, false, n);
+    let mut day = Column::new("day", Kind::Date, false, n);
+    let mut sessions = Column::new("sessions", Kind::Int64, false, n);
+    let mut purchasing = Column::new("purchasing_sessions", Kind::Int64, false, n);
+    let mut revenue = Column::new("revenue_cents", Kind::Int64, false, n);
+    let mut assisted = Column::new("assisted_sessions", Kind::Int64, false, n);
+    for row in rows {
+        campaign_id.text(Some(&row.campaign_id));
+        channel.text(Some(&row.channel));
+        day.date(row.day);
+        sessions.int64(row.sessions);
+        purchasing.int64(row.purchasing_sessions);
+        revenue.int64(row.revenue);
+        assisted.int64(row.assisted_sessions);
+    }
+    let columns = [campaign_id, channel, day, sessions, purchasing, revenue, assisted];
+    write(dir, "part-0.parquet", n, &columns);
+}
+
+fn write_campaigns_crate(dir: &Path, rows: &[CampaignRow]) {
     let mut writer = open(
         dir,
         0,
