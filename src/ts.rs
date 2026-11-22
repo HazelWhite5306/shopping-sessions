@@ -98,17 +98,141 @@ fn calendar() -> &'static Calendar {
     })
 }
 
+/// Every valid `YYYY-MM-DD` near the window, keyed by its 10 bytes in a
+/// 256-slot table with no collisions: a date found there needs no decoding
+/// or checking.
+struct Dates {
+    slots: Vec<(u64, u16, i64)>,
+    multiplier: u64,
+}
+
+static DATES: std::sync::OnceLock<Dates> = std::sync::OnceLock::new();
+
+#[inline]
+fn date_slot(multiplier: u64, head: u64, tail: u16) -> usize {
+    ((head ^ (u64::from(tail) << 3)).wrapping_mul(multiplier) >> 56) as usize
+}
+
+/// Builds the date table for days from `from_ms` to `to_ms`, padded by 10
+/// days each side. Call once before parsing; without it every date takes
+/// the full check.
+pub fn set_window(from_ms: i64, to_ms: i64) {
+    let first = from_ms.div_euclid(DAY) - 10;
+    let last = to_ms.div_euclid(DAY) + 10;
+    if last - first > 200 {
+        return;
+    }
+    let mut dates = Vec::new();
+    for days in first..=last {
+        let mut text = Vec::new();
+        // Midnight of `days`, written as F1, gives its YYYY-MM-DD.
+        let ms = days * DAY;
+        let (year, month, day) = civil_from_days(ms.div_euclid(DAY));
+        if !(0..=9999).contains(&year) {
+            continue;
+        }
+        text.extend_from_slice(format!("{year:04}-{month:02}-{day:02}").as_bytes());
+        let head = u64::from_le_bytes(text[0..8].try_into().unwrap());
+        let tail = u16::from_le_bytes([text[8], text[9]]);
+        dates.push((head, tail, days));
+    }
+    let mut multiplier = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..100_000 {
+        let mut slots = vec![(0u64, 0u16, 0i64); 256];
+        let mut clash = false;
+        for &(head, tail, days) in &dates {
+            let at = date_slot(multiplier, head, tail);
+            if slots[at].0 != 0 {
+                clash = true;
+                break;
+            }
+            slots[at] = (head, tail, days);
+        }
+        if !clash {
+            let _ = DATES.set(Dates { slots, multiplier });
+            return;
+        }
+        multiplier = multiplier
+            .wrapping_mul(0x5851_F42D_4C95_7F2D)
+            .wrapping_add(0x1405_7B7E_F767_814F)
+            | 1;
+    }
+}
+
+/// (year, month, day) of a day count (Howard Hinnant's civil_from_days).
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    (
+        year_of_era + era * 400 + i64::from(month <= 2),
+        month,
+        day_of_year - (153 * month_index + 2) / 5 + 1,
+    )
+}
+
 /// The fast path for F1 and F2: table lookups for the date and branch-free
 /// digit checks. `parse` stays the reference; tests compare the two.
 pub struct Parser {
     calendar: &'static Calendar,
+    dates: Option<&'static Dates>,
 }
 
 impl Parser {
     pub fn new() -> Self {
         Parser {
             calendar: calendar(),
+            dates: DATES.get(),
         }
+    }
+
+    /// `civil` for a date in the window's table: one lookup for the date,
+    /// then the time read as one word. Other dates take `civil`.
+    #[inline]
+    fn civil_known(&mut self, s: &[u8]) -> Option<i64> {
+        let Some(dates) = self.dates else {
+            return self.civil(s);
+        };
+        let head = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let tail = u16::from_le_bytes([s[8], s[9]]);
+        let slot = unsafe { *dates.slots.get_unchecked(date_slot(dates.multiplier, head, tail)) };
+        if slot.0 != head || slot.1 != tail {
+            return self.civil(s);
+        }
+        if s[10] != b'T' {
+            return None;
+        }
+        // "HH:MM:SS": colons at bytes 2 and 5, digits elsewhere.
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        const COLONS: u64 = 0xFF << 16 | 0xFF << 40;
+        const COLON_BYTES: u64 = (b':' as u64) << 16 | (b':' as u64) << 40;
+        let time = u64::from_le_bytes(s[11..19].try_into().unwrap());
+        if time & COLONS != COLON_BYTES {
+            return None;
+        }
+        let zeros = 0x30 * ONES;
+        let digits = (time & !COLONS) | (zeros & COLONS);
+        if (digits.wrapping_add(0x46 * ONES) | digits.wrapping_sub(zeros)) & (0x80 * ONES) != 0 {
+            return None;
+        }
+        let d = digits - zeros;
+        let byte = |at: u32| ((d >> (8 * at)) & 0xFF) as i64;
+        let hour = byte(0) * 10 + byte(1);
+        let minute = byte(3) * 10 + byte(4);
+        let second = byte(6) * 10 + byte(7);
+        if hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        Some(((slot.2 * 24 + hour) * 60 + minute) * MINUTE + second * SECOND)
     }
 
     /// The UTC-naive milliseconds of `YYYY-MM-DDTHH:MM:SS` at the start of
@@ -195,7 +319,7 @@ impl Parser {
             if s[19] != b'Z' {
                 return parse(s);
             }
-            return self.civil(s);
+            return self.civil_known(s);
         }
         let sign = match s[19] {
             b'+' => 1,
@@ -210,7 +334,7 @@ impl Parser {
         if oh > 23 || om > 59 {
             return None;
         }
-        let local = self.civil(s)?;
+        let local = self.civil_known(s)?;
         Some(local - sign * (oh * 60 + om) * MINUTE)
     }
 }
@@ -324,8 +448,13 @@ mod tests {
 
     #[test]
     fn cached_parser_matches() {
-        let seeds: [&[u8]; 6] = [
+        let seeds: [&[u8]; 11] = [
             b"2026-10-03T23:58:10Z",
+            b"2026-10-10T12:00:00Z",
+            b"2026-09-21T00:00:00+05:30",
+            b"2026-10-25T23:59:59Z",
+            b"2026-09-20T23:59:59Z",
+            b"2026-10-26T00:00:00-10:00",
             b"2026-10-03T19:58:10-04:00",
             b"2028-02-29T00:00:00+12:00",
             b"1791071890000",
@@ -340,7 +469,10 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (state >> 33) as usize
         };
+        // 2026-10-01 to 2026-10-15: table dates 2026-09-21..2026-10-25.
+        set_window(1_790_812_800_000, 1_792_022_400_000);
         let mut parser = Parser::new();
+        assert!(parser.dates.is_some());
         for _ in 0..1_000_000 {
             let mut s = seeds[next() % seeds.len()].to_vec();
             for _ in 0..next() % 3 {

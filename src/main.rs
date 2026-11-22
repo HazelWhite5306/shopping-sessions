@@ -728,6 +728,8 @@ fn run(data: &Path, output: &Path, start: Instant) {
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let window_start = manifest_time(&manifest, "\"window_start\"");
     let window_end = manifest_time(&manifest, "\"window_end\"");
+    // Dates of every valid event and click time, for the timestamp parser.
+    ts::set_window(window_start - WEEK, window_end);
 
     let products_raw = fs::read(data.join("products.csv")).unwrap_or_default();
     let campaigns_raw = fs::read(data.join("campaigns.csv")).unwrap_or_default();
