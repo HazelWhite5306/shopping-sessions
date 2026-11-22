@@ -82,13 +82,8 @@ impl Key {
     #[inline]
     pub fn hash(self) -> u64 {
         if self.is_inline() {
-            fold(
-                fold(
-                    self.hi ^ 0xe703_7ed1_a0b4_28db,
-                    self.lo ^ 0x8ebc_6af0_9c88_c6e3,
-                ),
-                0xa076_1d64_78bd_642f,
-            )
+            // One folded 128-bit multiply mixes both halves (wyhash's core).
+            fold(self.hi ^ 0xe703_7ed1_a0b4_28db, self.lo ^ 0x8ebc_6af0_9c88_c6e3)
         } else {
             hash_bytes(Text(self.hi).get())
         }
