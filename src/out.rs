@@ -11,15 +11,6 @@ use parquet::file::properties::{WriterProperties, WriterVersion};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 
-pub struct UserRow {
-    pub user_id: Vec<u8>,
-    pub day: i32,
-    pub sessions: i64,
-    pub events: i64,
-    pub revenue: i64,
-    pub top_category: Option<Vec<u8>>,
-}
-
 pub struct CampaignRow {
     pub campaign_id: Vec<u8>,
     pub channel: Vec<u8>,
@@ -72,7 +63,20 @@ macro_rules! column {
     }};
 }
 
-pub fn write_users(dir: &Path, part: usize, rows: &[UserRow]) {
+/// One user_daily row: (person, day, sessions, events, revenue, category),
+/// with category `no_category` for none.
+pub type UserRow = (u32, i32, u32, u32, u64, u16);
+
+/// Writes one user_daily file. Every user ID goes into one shared buffer and
+/// each value is a slice of it, so no row allocates.
+pub fn write_users(
+    dir: &Path,
+    part: usize,
+    rows: &[UserRow],
+    write_name: impl Fn(u32, &mut Vec<u8>),
+    categories: &[&[u8]],
+    no_category: u16,
+) {
     let mut writer = open(
         dir,
         part,
@@ -86,24 +90,46 @@ pub fn write_users(dir: &Path, part: usize, rows: &[UserRow]) {
         }",
     );
     let mut group = writer.next_row_group().expect("row group");
-    let ids = bytes(rows.iter().map(|r| r.user_id.clone()));
-    column!(group, ByteArrayType, ids, None);
-    let days: Vec<i32> = rows.iter().map(|r| r.day).collect();
-    column!(group, Int32Type, days, None);
-    let sessions: Vec<i64> = rows.iter().map(|r| r.sessions).collect();
-    column!(group, Int64Type, sessions, None);
-    let events: Vec<i64> = rows.iter().map(|r| r.events).collect();
-    column!(group, Int64Type, events, None);
-    let revenue: Vec<i64> = rows.iter().map(|r| r.revenue).collect();
-    column!(group, Int64Type, revenue, None);
-    let levels: Vec<i16> = rows
+    let mut buffer = Vec::with_capacity(rows.len() * 12);
+    let mut ends = Vec::with_capacity(rows.len());
+    for row in rows {
+        write_name(row.0, &mut buffer);
+        ends.push(buffer.len());
+    }
+    let shared = bytes::Bytes::from(buffer);
+    let mut start = 0;
+    let ids: Vec<ByteArray> = ends
         .iter()
-        .map(|r| i16::from(r.top_category.is_some()))
+        .map(|&end| {
+            let value = ByteArray::from(shared.slice(start..end));
+            start = end;
+            value
+        })
         .collect();
-    let categories = bytes(rows.iter().filter_map(|r| r.top_category.clone()));
-    column!(group, ByteArrayType, categories, Some(&levels[..]));
+    column!(group, ByteArrayType, ids, None);
+    let days: Vec<i32> = rows.iter().map(|r| r.1).collect();
+    column!(group, Int32Type, days, None);
+    let sessions: Vec<i64> = rows.iter().map(|r| i64::from(r.2)).collect();
+    column!(group, Int64Type, sessions, None);
+    let events: Vec<i64> = rows.iter().map(|r| i64::from(r.3)).collect();
+    column!(group, Int64Type, events, None);
+    let revenue: Vec<i64> = rows.iter().map(|r| r.4 as i64).collect();
+    column!(group, Int64Type, revenue, None);
+    let levels: Vec<i16> = rows.iter().map(|r| i16::from(r.5 != no_category)).collect();
+    let names: Vec<ByteArray> = categories
+        .iter()
+        .map(|name| ByteArray::from(bytes::Bytes::copy_from_slice(name)))
+        .collect();
+    let values: Vec<ByteArray> = rows
+        .iter()
+        .filter(|r| r.5 != no_category)
+        .map(|r| names[r.5 as usize].clone())
+        .collect();
+    column!(group, ByteArrayType, values, Some(&levels[..]));
     group.close().expect("close row group");
     writer.close().expect("close parquet");
+    // Freeing each value one by one is wasted work: the process exits soon.
+    std::mem::forget((ids, values));
 }
 
 pub fn write_campaigns(dir: &Path, rows: &[CampaignRow]) {

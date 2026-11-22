@@ -74,6 +74,7 @@ impl Key {
         }
     }
 
+    #[cfg(test)]
     pub fn to_vec(self) -> Vec<u8> {
         self.with_bytes(<[u8]>::to_vec)
     }

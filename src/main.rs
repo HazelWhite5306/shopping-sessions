@@ -17,6 +17,7 @@ mod ts;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use hashbrown::HashTable;
@@ -26,7 +27,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use key::Key;
-use out::{CampaignRow, UserRow};
+use out::CampaignRow;
 use ts::DAY;
 
 #[global_allocator]
@@ -634,14 +635,44 @@ fn parse_click(
     })
 }
 
-fn find(parent: &mut [u32], mut x: u32) -> u32 {
-    while parent[x as usize] != x {
-        let up = parent[parent[x as usize] as usize];
-        parent[x as usize] = up;
-        x = up;
+/// The root of `x`, halving the path as it goes. Concurrent finds and
+/// unions are safe: every write moves a node to one of its ancestors.
+fn find_atomic(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let up = parent[x as usize].load(Ordering::Relaxed);
+        if up == x {
+            return x;
+        }
+        let grand = parent[up as usize].load(Ordering::Relaxed);
+        if grand != up {
+            let _ = parent[x as usize].compare_exchange_weak(
+                up,
+                grand,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        x = grand;
     }
-    x
 }
+
+/// Joins the sets of `a` and `b`, linking the larger root under the smaller.
+fn union_atomic(parent: &[AtomicU32], a: u32, b: u32) {
+    loop {
+        let (ra, rb) = (find_atomic(parent, a), find_atomic(parent, b));
+        if ra == rb {
+            return;
+        }
+        let (high, low) = if ra > rb { (ra, rb) } else { (rb, ra) };
+        if parent[high as usize]
+            .compare_exchange(high, low, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
 
 /// `shards` empty Vecs, each with room for `each` items.
 fn shard_vecs<T>(shards: usize, each: usize) -> Vec<Vec<T>> {
@@ -908,26 +939,38 @@ fn run(data: &Path, output: &Path, start: Instant) {
     log(start, "deduplicated");
 
     // 3. Intern user IDs per shard, reading every producer's part in place.
-    let mut link_sides: Vec<Vec<(u32, Key, u64)>> = (0..SHARDS).map(|_| Vec::new()).collect();
-    for (at, [a, b]) in links.iter().enumerate() {
-        for (side, id) in [a, b].into_iter().enumerate() {
-            let id = Key::new(id);
-            let hash = id.hash();
-            link_sides[shard(hash)].push(((at * 2 + side) as u32, id, hash));
-        }
-    }
-    let mut users: Vec<UserShard> = link_sides
-        .into_par_iter()
+    // Link sides, sharded by ID in parallel blocks: (link * 2 + side, ID, hash).
+    const LINK_BLOCK: usize = 1 << 16;
+    let link_parts: Vec<Vec<Vec<(u32, Key, u64)>>> = links
+        .par_chunks(LINK_BLOCK)
         .enumerate()
-        .map(|(at, sides)| {
+        .map(|(block, rows)| {
+            let mut out: Vec<Vec<(u32, Key, u64)>> =
+                shard_vecs(SHARDS, rows.len() * 2 / SHARDS * 5 / 4 + 16);
+            for (offset, [a, b]) in rows.iter().enumerate() {
+                let at = block * LINK_BLOCK + offset;
+                for (side, id) in [a, b].into_iter().enumerate() {
+                    let id = Key::new(id);
+                    let hash = id.hash();
+                    out[shard(hash)].push(((at * 2 + side) as u32, id, hash));
+                }
+            }
+            out
+        })
+        .collect();
+    let mut users: Vec<UserShard> = (0..SHARDS)
+        .into_par_iter()
+        .map(|at| {
             let event_count: usize = live.iter().map(|part| part[at].len()).sum();
             let click_count: usize = clicks.iter().map(|part| part[at].len()).sum();
+            let side_count: usize = link_parts.iter().map(|part| part[at].len()).sum();
             let mut ids = Interner {
                 names: Vec::new(),
-                table: HashTable::with_capacity((event_count + click_count) / 8 + sides.len() + 64),
+                table: HashTable::with_capacity((event_count + click_count) / 8 + side_count + 64),
             };
-            let link_sides: Vec<(u32, u32)> = sides
+            let link_sides: Vec<(u32, u32)> = link_parts
                 .iter()
+                .flat_map(|part| part[at].iter())
                 .map(|&(code, id, hash)| (code, ids.intern(id, hash)))
                 .collect();
             let mut events = Vec::with_capacity(event_count);
@@ -980,33 +1023,97 @@ fn run(data: &Path, output: &Path, start: Instant) {
             link_ids[code as usize] = offset + local;
         }
     }
-    let mut parent: Vec<u32> = (0..count as u32).collect();
-    let mut smallest: Vec<u32> = (0..count as u32).collect();
-    for pair in link_ids.chunks_exact(2) {
-        let (ra, rb) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
-        if ra != rb {
-            parent[rb as usize] = ra;
-            let (sa, sb) = (smallest[ra as usize], smallest[rb as usize]);
-            if names[sb as usize] < names[sa as usize] {
-                smallest[ra as usize] = sb;
+    // Concurrent union-find: a root's parent only ever moves to a smaller
+    // index, so the forest stays acyclic whatever the interleaving.
+    let parent: Vec<AtomicU32> = (0..count as u32).map(AtomicU32::new).collect();
+    link_ids.par_chunks(2 * 4096).for_each(|pairs| {
+        for pair in pairs.chunks_exact(2) {
+            union_atomic(&parent, pair[0], pair[1]);
+        }
+    });
+    // Each person's name: the byte-wise smallest ID among its members.
+    let root: Vec<u32> = (0..count as u32)
+        .into_par_iter()
+        .map(|id| find_atomic(&parent, id))
+        .collect();
+    let smallest: Vec<AtomicU32> = (0..count as u32).map(AtomicU32::new).collect();
+    (0..count as u32).into_par_iter().for_each(|id| {
+        let top = root[id as usize];
+        if top == id {
+            return;
+        }
+        let slot = &smallest[top as usize];
+        let mut current = slot.load(Ordering::Relaxed);
+        while names[id as usize] < names[current as usize] {
+            match slot.compare_exchange_weak(current, id, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(seen) => current = seen,
             }
         }
-    }
+    });
+    let name_of = |id: u32| smallest[root[id as usize] as usize].load(Ordering::Relaxed);
     // Number each person within their bucket, so the session phase indexes
     // small bucket-local arrays. person[id] = bucket << 24 | local index;
-    // bucket_people[bucket][local] is the person's name ID.
-    let mut person = vec![0u32; count];
-    let mut local = vec![u32::MAX; count];
-    let mut bucket_people: Vec<Vec<u32>> = (0..BUCKETS).map(|_| Vec::new()).collect();
-    for id in 0..count as u32 {
-        let name = smallest[find(&mut parent, id) as usize];
-        let at = bucket(name);
-        if local[name as usize] == u32::MAX {
-            local[name as usize] = bucket_people[at].len() as u32;
-            bucket_people[at].push(name);
+    // bucket_people[bucket][local] is the person's name ID. A person is an ID
+    // that is its own name; ranges count them per bucket in parallel, then
+    // each range fills its share of every bucket.
+    let range = count.div_ceil(rayon::current_num_threads() * 4).max(1);
+    let counts: Vec<Vec<u32>> = (0..count)
+        .into_par_iter()
+        .step_by(range)
+        .map(|from| {
+            let mut counts = vec![0u32; BUCKETS];
+            for id in from as u32..(from + range).min(count) as u32 {
+                if name_of(id) == id {
+                    counts[bucket(id)] += 1;
+                }
+            }
+            counts
+        })
+        .collect();
+    let mut offsets = vec![vec![0u32; BUCKETS]; counts.len()];
+    let mut bucket_sizes = vec![0u32; BUCKETS];
+    for at in 0..BUCKETS {
+        for (part, part_counts) in counts.iter().enumerate() {
+            offsets[part][at] = bucket_sizes[at];
+            bucket_sizes[at] += part_counts[at];
         }
-        person[id as usize] = (at as u32) << 24 | local[name as usize];
     }
+    let mut bucket_people: Vec<Vec<u32>> = bucket_sizes
+        .iter()
+        .map(|&size| vec![0u32; size as usize])
+        .collect();
+    let mut local = vec![0u32; count];
+    {
+        struct Shared(*mut u32);
+        unsafe impl Sync for Shared {}
+        unsafe impl Send for Shared {}
+        let local_out = Shared(local.as_mut_ptr());
+        let people_out: Vec<Shared> = bucket_people.iter_mut().map(|v| Shared(v.as_mut_ptr())).collect();
+        let (local_out, people_out) = (&local_out, &people_out);
+        offsets.into_par_iter().enumerate().for_each(|(part, mut next)| {
+            let from = part * range;
+            for id in from as u32..(from + range).min(count) as u32 {
+                if name_of(id) == id {
+                    let at = bucket(id);
+                    // Each range writes its own slots of each bucket, and
+                    // each person ID once.
+                    unsafe {
+                        *people_out[at].0.add(next[at] as usize) = id;
+                        *local_out.0.add(id as usize) = next[at];
+                    }
+                    next[at] += 1;
+                }
+            }
+        });
+    }
+    let person: Vec<u32> = (0..count as u32)
+        .into_par_iter()
+        .map(|id| {
+            let name = name_of(id);
+            (bucket(name) as u32) << 24 | local[name as usize]
+        })
+        .collect();
     assert!(
         bucket_people.iter().all(|people| people.len() < 1 << 24),
         "too many people in one bucket"
@@ -1149,18 +1256,10 @@ fn run(data: &Path, output: &Path, start: Instant) {
     log(start, &format!("sessions: {}", tally.session));
 
     // 7. Write both tables.
-    let user_rows: Vec<UserRow> = tally
-        .users
-        .par_iter()
-        .map(|&(who, day, sessions, events, revenue, top)| UserRow {
-            user_id: names[who as usize].to_vec(),
-            day,
-            sessions: i64::from(sessions),
-            events: i64::from(events),
-            revenue: revenue as i64,
-            top_category: (top != NO_CATEGORY).then(|| category_names[top as usize].to_vec()),
-        })
-        .collect();
+    let user_rows: &[out::UserRow] = &tally.users;
+    let write_name = |who: u32, buffer: &mut Vec<u8>| {
+        names[who as usize].with_bytes(|bytes| buffer.extend_from_slice(bytes))
+    };
     let mut campaign_rows = Vec::new();
     for campaign in 0..campaign_slots {
         for day_slot in 0..days {
@@ -1194,9 +1293,11 @@ fn run(data: &Path, output: &Path, start: Instant) {
             user_rows
                 .par_chunks(per_file)
                 .enumerate()
-                .for_each(|(part, rows)| out::write_users(&user_dir, part, rows));
+                .for_each(|(part, rows)| {
+                    out::write_users(&user_dir, part, rows, write_name, &category_names, NO_CATEGORY)
+                });
             if user_rows.is_empty() {
-                out::write_users(&user_dir, 0, &[]);
+                out::write_users(&user_dir, 0, &[], write_name, &category_names, NO_CATEGORY);
             }
         },
         || out::write_campaigns(&output.join("campaign_daily"), &campaign_rows),
@@ -1210,6 +1311,11 @@ fn run(data: &Path, output: &Path, start: Instant) {
         ),
     );
     // The maps must outlive every Text; main exits without unmapping them.
+    // The process exits right after: freeing millions of small buffers here
+    // took one thread ~65 ms at 20M, so everything large is left in place.
+    // The maps must outlive every Text anyway.
+    std::mem::forget((campaign_rows, tally, names, users));
+    std::mem::forget((person, local, bucket_people, smallest, parent, link_ids, links));
     std::mem::forget((event_maps, click_maps, link_maps));
 }
 
